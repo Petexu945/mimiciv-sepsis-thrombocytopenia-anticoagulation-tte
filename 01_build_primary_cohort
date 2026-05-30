@@ -1,0 +1,3377 @@
+-- Step 1.1: Adult + first ICU stay base table
+-- Output: anticoagulant.base_first_stay  (name can be changed to your preferred schema)
+-- Depends on: icu.icustays, hosp.admissions, hosp.patients
+
+CREATE SCHEMA IF NOT EXISTS anticoagulant;
+
+DROP TABLE IF EXISTS anticoagulant.base_first_stay;
+
+CREATE TABLE anticoagulant.base_first_stay AS
+WITH joined AS (
+    SELECT
+        i.subject_id,
+        i.hadm_id,
+        i.stay_id,
+        i.intime,
+        i.outtime,
+        i.first_careunit,
+        i.last_careunit,
+        i.los AS icu_los_days,
+
+        a.admittime,
+        a.dischtime,
+        a.deathtime,
+        a.hospital_expire_flag,
+
+        p.gender,
+        p.anchor_age,
+        p.anchor_year,
+
+        -- MIMIC-IV de-identified age approximation at ICU intime
+        (p.anchor_age + (EXTRACT(YEAR FROM i.intime)::int - p.anchor_year))::int AS age_icu
+    FROM mimiciv_icu.icustays i
+    INNER JOIN mimiciv_hosp.admissions a
+        ON a.hadm_id = i.hadm_id
+       AND a.subject_id = i.subject_id
+    INNER JOIN mimiciv_hosp.patients p
+        ON p.subject_id = i.subject_id
+    WHERE i.intime IS NOT NULL
+      AND i.outtime IS NOT NULL
+),
+ranked AS (
+    SELECT
+        j.*,
+        ROW_NUMBER() OVER (PARTITION BY j.subject_id ORDER BY j.intime, j.stay_id) AS rn
+    FROM joined j
+    WHERE j.age_icu >= 18
+)
+SELECT
+    subject_id,
+    hadm_id,
+    stay_id,
+    intime,
+    outtime,
+    first_careunit,
+    last_careunit,
+    icu_los_days,
+    admittime,
+    dischtime,
+    deathtime,
+    hospital_expire_flag,
+    gender,
+    age_icu
+FROM ranked
+WHERE rn = 1;
+
+-- Recommended indexes for downstream joins
+CREATE UNIQUE INDEX IF NOT EXISTS idx_base_first_stay_stay_id
+    ON anticoagulant.base_first_stay(stay_id);
+
+CREATE INDEX IF NOT EXISTS idx_base_first_stay_subject_id
+    ON anticoagulant.base_first_stay(subject_id);
+
+CREATE INDEX IF NOT EXISTS idx_base_first_stay_hadm_id
+    ON anticoagulant.base_first_stay(hadm_id);
+
+CREATE INDEX IF NOT EXISTS idx_base_first_stay_intime
+    ON anticoagulant.base_first_stay(intime);
+
+
+
+--qc--
+-- Row count
+SELECT COUNT(*) AS n_rows FROM anticoagulant.base_first_stay;
+
+-- Age distribution sanity check
+SELECT
+    MIN(age_icu) AS min_age,
+    PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY age_icu) AS p25,
+    PERCENTILE_CONT(0.50) WITHIN GROUP (ORDER BY age_icu) AS median,
+    PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY age_icu) AS p75,
+    MAX(age_icu) AS max_age
+FROM anticoagulant.base_first_stay;
+
+-- ICU type mix
+SELECT first_careunit, COUNT(*) AS n
+FROM anticoagulant.base_first_stay
+GROUP BY first_careunit
+ORDER BY n DESC;
+
+
+-- Step 1.2A: Normalize platelet (PLT) into K/µL and apply strong QC flags
+-- Output: anticoagulant.plt_labs_norm
+-- Depends on: anticoagulant.base_first_stay, mimiciv_hosp.labevents
+
+DROP TABLE IF EXISTS anticoagulant.plt_labs_norm;
+
+CREATE TABLE anticoagulant.plt_labs_norm AS
+SELECT
+    b.subject_id,
+    b.hadm_id,
+    b.stay_id,
+    b.intime,
+    b.outtime,
+
+    le.labevent_id,
+    le.charttime,
+    le.valuenum,
+    le.valueuom,
+
+    CASE
+        WHEN le.valuenum IS NULL THEN NULL
+        WHEN le.valuenum > 1000 THEN (le.valuenum / 1000.0)
+        ELSE le.valuenum
+    END AS plt_k,
+
+    CASE
+        WHEN le.valuenum IS NOT NULL AND le.valuenum > 1000 THEN 1
+        ELSE 0
+    END AS unit_fix_flag,
+
+    CASE
+        WHEN le.valuenum IS NULL THEN 0
+        WHEN (
+            CASE
+                WHEN le.valuenum > 1000 THEN (le.valuenum / 1000.0)
+                ELSE le.valuenum
+            END
+        ) > 0
+        AND (
+            CASE
+                WHEN le.valuenum > 1000 THEN (le.valuenum / 1000.0)
+                ELSE le.valuenum
+            END
+        ) < 1000
+        THEN 1
+        ELSE 0
+    END AS qc_keep_flag
+FROM anticoagulant.base_first_stay b
+INNER JOIN mimiciv_hosp.labevents le
+    ON le.subject_id = b.subject_id
+   AND le.hadm_id    = b.hadm_id
+WHERE le.itemid = 51265
+  AND le.charttime >= b.intime
+  AND le.charttime <= b.outtime;
+
+-- Indexes for downstream selection and speed
+CREATE INDEX IF NOT EXISTS idx_plt_labs_norm_stay_charttime
+    ON anticoagulant.plt_labs_norm(stay_id, charttime);
+
+CREATE INDEX IF NOT EXISTS idx_plt_labs_norm_keep
+    ON anticoagulant.plt_labs_norm(qc_keep_flag);
+
+CREATE INDEX IF NOT EXISTS idx_plt_labs_norm_unitfix
+    ON anticoagulant.plt_labs_norm(unit_fix_flag);
+
+
+
+-- Step 1.2B: QC summary log table
+-- Output: anticoagulant.plt_qc_summary
+
+DROP TABLE IF EXISTS anticoagulant.plt_qc_summary;
+
+CREATE TABLE anticoagulant.plt_qc_summary AS
+WITH x AS (
+    SELECT
+        *,
+        CASE
+            WHEN valuenum IS NULL THEN NULL
+            WHEN valuenum > 1000 THEN (valuenum / 1000.0)
+            ELSE valuenum
+        END AS plt_k_calc
+    FROM anticoagulant.plt_labs_norm
+)
+SELECT
+    COUNT(*)                                                   AS n_total,
+    SUM(CASE WHEN valuenum IS NULL THEN 1 ELSE 0 END)         AS n_null_valuenum,
+    SUM(CASE WHEN valuenum IS NOT NULL AND valuenum > 1000
+             THEN 1 ELSE 0 END)                               AS n_unit_fix_flag,
+    SUM(CASE WHEN plt_k_calc IS NOT NULL AND plt_k_calc <= 0
+             THEN 1 ELSE 0 END)                               AS n_out_low,
+    SUM(CASE WHEN plt_k_calc IS NOT NULL AND plt_k_calc >= 1000
+             THEN 1 ELSE 0 END)                               AS n_out_high,
+    SUM(CASE WHEN plt_k_calc IS NOT NULL AND plt_k_calc > 0 AND plt_k_calc < 1000
+             THEN 1 ELSE 0 END)                               AS n_kept_after_strong_qc
+FROM x;
+
+
+-- Step 1.2C: Extract t0 = first charttime with PLT in [30,50] K/µL after ICU intime
+-- Output: anticoagulant.plt_t0
+
+DROP TABLE IF EXISTS anticoagulant.plt_t0;
+
+CREATE TABLE anticoagulant.plt_t0 AS
+WITH candidates AS (
+    SELECT
+        subject_id,
+        hadm_id,
+        stay_id,
+        charttime AS t0,
+        plt_k     AS plt_k_t0,
+        unit_fix_flag AS unit_fix_flag_t0,
+        labevent_id   AS labevent_id_t0,
+        ROW_NUMBER() OVER (
+            PARTITION BY stay_id
+            ORDER BY charttime ASC, labevent_id ASC
+        ) AS rn
+    FROM anticoagulant.plt_labs_norm
+    WHERE qc_keep_flag = 1
+      AND plt_k BETWEEN 30 AND 50
+)
+SELECT
+    subject_id,
+    hadm_id,
+    stay_id,
+    t0,
+    plt_k_t0,
+    unit_fix_flag_t0,
+    labevent_id_t0
+FROM candidates
+WHERE rn = 1;
+
+-- Enforce one t0 per stay_id
+CREATE UNIQUE INDEX IF NOT EXISTS idx_plt_t0_stay_id
+    ON anticoagulant.plt_t0(stay_id);
+
+CREATE INDEX IF NOT EXISTS idx_plt_t0_t0
+    ON anticoagulant.plt_t0(t0);
+    
+
+--  qc--  
+-- 1) t0 有多少例
+SELECT COUNT(*) AS n_t0 FROM anticoagulant.plt_t0;
+
+-- 2) t0 的 PLT 是否全部在 [30,50]
+SELECT
+    MIN(plt_k_t0) AS min_plt,
+    MAX(plt_k_t0) AS max_plt
+FROM anticoagulant.plt_t0;
+
+-- 3) unit_fix 占比（了解单位纠正的规模）
+SELECT
+    SUM(unit_fix_flag_t0) AS n_unit_fix_t0,
+    COUNT(*)              AS n_total_t0,
+    (SUM(unit_fix_flag_t0)::numeric / NULLIF(COUNT(*),0)) AS prop_unit_fix_t0
+FROM anticoagulant.plt_t0;
+
+-- 4) QC 日志（异常计数）
+SELECT * FROM anticoagulant.plt_qc_summary;
+
+
+-- Step 1.3
+DROP TABLE IF EXISTS anticoagulant.sepsis_at_t0;
+
+CREATE TABLE anticoagulant.sepsis_at_t0 AS
+WITH sepsis_ranked AS (
+  SELECT
+    s3.stay_id,
+    s3.suspected_infection_time,
+    s3.antibiotic_time,
+    s3.culture_time,
+    s3.sofa_time,
+    s3.sofa_score,
+    s3.respiration,
+    s3.coagulation,
+    s3.liver,
+    s3.cardiovascular,
+    s3.cns,
+    s3.renal,
+    s3.sepsis3,
+    ROW_NUMBER() OVER (
+      PARTITION BY s3.stay_id
+      ORDER BY s3.sofa_time, s3.suspected_infection_time, s3.antibiotic_time, s3.culture_time
+    ) AS rn
+  FROM mimiciv_derived.sepsis3 s3
+  WHERE s3.sepsis3 IS TRUE
+    AND s3.sofa_time IS NOT NULL
+)
+SELECT
+  p.subject_id,
+  p.hadm_id,
+  p.stay_id,
+  p.t0,
+
+  -- 文档要求的 sepsis_onset_time（用于 <= t0 纳入）
+  s.sofa_time AS sepsis_onset_time,
+
+  -- 其余信息（便于 QC/审计）
+  s.suspected_infection_time,
+  s.antibiotic_time,
+  s.culture_time,
+  s.sofa_time,
+  s.sofa_score,
+  s.respiration,
+  s.coagulation,
+  s.liver,
+  s.cardiovascular,
+  s.cns,
+  s.renal
+FROM anticoagulant.plt_t0 p
+INNER JOIN sepsis_ranked s
+  ON s.stay_id = p.stay_id
+ AND s.rn = 1
+WHERE s.sofa_time <= p.t0;
+
+
+DROP INDEX IF EXISTS anticoagulant.idx_sepsis_at_t0_stay_id;
+DROP INDEX IF EXISTS anticoagulant.idx_sepsis_at_t0_hadm_id;
+
+CREATE INDEX idx_sepsis_at_t0_stay_id ON anticoagulant.sepsis_at_t0 (stay_id);
+CREATE INDEX idx_sepsis_at_t0_hadm_id ON anticoagulant.sepsis_at_t0 (hadm_id);
+
+ANALYZE anticoagulant.sepsis_at_t0;
+
+
+
+-- 1) 行数 & 与 plt_t0 的对比（被 sepsis 条件筛掉多少）
+SELECT
+  (SELECT COUNT(*) FROM anticoagulant.plt_t0) AS n_plt_t0,
+  (SELECT COUNT(*) FROM anticoagulant.sepsis_at_t0) AS n_sepsis_at_t0;
+
+-- 2) 唯一性：每个 stay_id 应该至多 1 行
+SELECT
+  COUNT(*) AS n_rows,
+  COUNT(DISTINCT stay_id) AS n_distinct_stay_id
+FROM anticoagulant.sepsis_at_t0;
+
+-- 3) 时间顺序：确认 sepsis_onset_time <= t0（理论上 WHERE 已保证，这里用于审计）
+SELECT
+  COUNT(*) AS n_violations
+FROM anticoagulant.sepsis_at_t0
+WHERE sepsis_onset_time > t0;
+
+
+-- Step 1.4.1A (FIXED): Therapeutic anticoagulation events before t0
+-- Key fix: inputevents has no "label"; join mimiciv_icu.d_items to get label
+-- Requirement: must distinguish flush/lock (exclude) 
+
+DROP TABLE IF EXISTS anticoagulant.therapeutic_anticoag_events_pre_t0;
+
+CREATE TABLE anticoagulant.therapeutic_anticoag_events_pre_t0 AS
+WITH cohort AS (
+    SELECT subject_id, hadm_id, stay_id, t0
+    FROM anticoagulant.sepsis_at_t0
+),
+
+-- (1) UFH infusion：识别连续静滴/滴定；排除 flush/lock
+ufh_infusion AS (
+    SELECT
+        c.subject_id,
+        c.hadm_id,
+        c.stay_id,
+        ie.starttime AS event_time,
+        'icu_inputevents'::text AS src,
+        ie.itemid,
+        di.label,
+        ie.ordercategoryname,
+        ie.amount,
+        ie.amountuom,
+        ie.rate,
+        ie.rateuom,
+        NULL::text    AS drug,
+        NULL::numeric AS dose_val,
+        NULL::text    AS dose_unit
+    FROM cohort c
+    INNER JOIN mimiciv_icu.inputevents ie
+        ON ie.stay_id = c.stay_id
+    LEFT JOIN mimiciv_icu.d_items di
+        ON di.itemid = ie.itemid
+    WHERE ie.starttime < c.t0
+      AND di.label IS NOT NULL
+      AND lower(di.label) LIKE '%heparin%'
+      AND lower(di.label) NOT LIKE '%flush%'
+      AND lower(di.label) NOT LIKE '%lock%'
+      AND (
+            ie.rate IS NOT NULL
+         OR lower(COALESCE(ie.ordercategoryname, '')) LIKE '%continuous%'
+         OR lower(COALESCE(ie.ordercategoryname, '')) LIKE '%titrate%'
+      )
+),
+
+-- (2) 处方覆盖：LMWH/DOAC/华法林等治疗性抗凝（避免漏排）
+rx_raw AS (
+    SELECT
+        c.subject_id,
+        c.hadm_id,
+        c.stay_id,
+        p.starttime AS event_time,
+        'hosp_prescriptions'::text AS src,
+        NULL::int   AS itemid,
+        p.drug      AS label,
+        NULL::text  AS ordercategoryname,
+        NULL::numeric AS amount,
+        NULL::text    AS amountuom,
+        NULL::numeric AS rate,
+        NULL::text    AS rateuom,
+        p.drug      AS drug,
+        CASE
+            WHEN p.dose_val_rx ~ '^[0-9]+(\.[0-9]+)?$' THEN p.dose_val_rx::numeric
+            ELSE NULL
+        END AS dose_val,
+        p.dose_unit_rx AS dose_unit
+    FROM cohort c
+    INNER JOIN mimiciv_hosp.prescriptions p
+        ON p.subject_id = c.subject_id
+       AND p.hadm_id    = c.hadm_id
+    WHERE p.starttime < c.t0
+      AND p.drug IS NOT NULL
+      AND lower(p.drug) NOT LIKE '%flush%'
+      AND lower(p.drug) NOT LIKE '%lock%'
+      AND (
+            lower(p.drug) LIKE '%warfarin%'
+         OR lower(p.drug) LIKE '%apixaban%'
+         OR lower(p.drug) LIKE '%rivaroxaban%'
+         OR lower(p.drug) LIKE '%dabigatran%'
+         OR lower(p.drug) LIKE '%edoxaban%'
+         OR lower(p.drug) LIKE '%fondaparinux%'
+         OR lower(p.drug) LIKE '%argatroban%'
+         OR lower(p.drug) LIKE '%bivalirudin%'
+         OR lower(p.drug) LIKE '%enoxaparin%'
+         OR lower(p.drug) LIKE '%lovenox%'
+      )
+),
+
+rx_therapeutic AS (
+    SELECT *
+    FROM rx_raw
+    WHERE
+        (
+            lower(drug) LIKE '%warfarin%'
+         OR lower(drug) LIKE '%apixaban%'
+         OR lower(drug) LIKE '%rivaroxaban%'
+         OR lower(drug) LIKE '%dabigatran%'
+         OR lower(drug) LIKE '%edoxaban%'
+         OR lower(drug) LIKE '%fondaparinux%'
+         OR lower(drug) LIKE '%argatroban%'
+         OR lower(drug) LIKE '%bivalirudin%'
+        )
+        OR
+        (
+            (lower(drug) LIKE '%enoxaparin%' OR lower(drug) LIKE '%lovenox%')
+            AND dose_val IS NOT NULL
+            AND lower(COALESCE(dose_unit, '')) IN ('mg', 'milligram', 'milligrams')
+            AND dose_val > 40
+        )
+)
+
+SELECT * FROM ufh_infusion
+UNION ALL
+SELECT * FROM rx_therapeutic;
+
+-- Step 1.4.1B
+
+DROP TABLE IF EXISTS anticoagulant.exclude_therapeutic_anticoag_flag;
+
+CREATE TABLE anticoagulant.exclude_therapeutic_anticoag_flag AS
+SELECT
+    s.stay_id,
+    CASE WHEN e.stay_id IS NULL THEN 0 ELSE 1 END AS exclude_therapeutic_anticoag_flag,
+    e.first_therapeutic_anticoag_time
+FROM anticoagulant.sepsis_at_t0 s
+LEFT JOIN (
+    SELECT
+        stay_id,
+        MIN(event_time) AS first_therapeutic_anticoag_time
+    FROM anticoagulant.therapeutic_anticoag_events_pre_t0
+    GROUP BY stay_id
+) e
+ON e.stay_id = s.stay_id;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_excl_thera_anticoag_stay_id
+    ON anticoagulant.exclude_therapeutic_anticoag_flag(stay_id);
+
+
+-- Step 1.4.2A
+
+DROP TABLE IF EXISTS anticoagulant.vte_icd_flags;
+
+CREATE TABLE anticoagulant.vte_icd_flags AS
+WITH cohort AS (
+    SELECT subject_id, hadm_id, stay_id
+    FROM anticoagulant.sepsis_at_t0
+),
+dx AS (
+    SELECT
+        c.stay_id,
+        d.icd_version,
+        upper(d.icd_code) AS icd_code
+    FROM cohort c
+    INNER JOIN mimiciv_hosp.diagnoses_icd d
+        ON d.subject_id = c.subject_id
+       AND d.hadm_id    = c.hadm_id
+)
+SELECT
+    stay_id,
+
+    -- (A) 明确“既往史/历史”VTE：时间上可解释为 t0 前既往/已确诊
+    MAX(
+        CASE
+            WHEN (icd_version = 10 AND icd_code IN ('Z86711', 'Z86718'))
+              OR (icd_version = 9  AND icd_code = 'V1251')
+            THEN 1 ELSE 0
+        END
+    ) AS icd_vte_history_flag,
+
+    -- (B) 任意 VTE 相关诊断（用于审计/敏感性；不建议在此阶段直接当作“t0 前”排除）
+    MAX(
+        CASE
+            WHEN (icd_version = 10 AND (icd_code LIKE 'I26%' OR icd_code LIKE 'I80%' OR icd_code LIKE 'I82%'))
+              OR (icd_version = 9  AND (icd_code LIKE '4151%' OR icd_code LIKE '451%' OR icd_code LIKE '453%'))
+            THEN 1 ELSE 0
+        END
+    ) AS icd_vte_any_flag
+FROM dx
+GROUP BY stay_id;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_vte_icd_flags_stay_id
+    ON anticoagulant.vte_icd_flags(stay_id);
+
+
+-- Step 1.4.2B
+
+DROP TABLE IF EXISTS anticoagulant.exclude_vte_pre_t0_flag;
+
+CREATE TABLE anticoagulant.exclude_vte_pre_t0_flag AS
+SELECT
+    s.stay_id,
+    COALESCE(v.icd_vte_history_flag, 0) AS exclude_vte_pre_t0_flag,
+    COALESCE(v.icd_vte_history_flag, 0) AS icd_vte_history_flag,
+    COALESCE(v.icd_vte_any_flag, 0)     AS icd_vte_any_flag
+FROM anticoagulant.sepsis_at_t0 s
+LEFT JOIN anticoagulant.vte_icd_flags v
+    ON v.stay_id = s.stay_id;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_excl_vte_pre_t0_stay_id
+    ON anticoagulant.exclude_vte_pre_t0_flag(stay_id);
+
+
+-- Step 1.4.3A
+
+DROP TABLE IF EXISTS anticoagulant.hb_drop_pre_t0;
+
+CREATE TABLE anticoagulant.hb_drop_pre_t0 AS
+WITH cohort AS (
+    SELECT stay_id, hadm_id, subject_id, t0
+    FROM anticoagulant.sepsis_at_t0
+),
+hb AS (
+    SELECT
+        c.stay_id,
+        le.charttime,
+        le.valuenum::numeric AS hb_g_dl
+    FROM cohort c
+    INNER JOIN mimiciv_hosp.labevents le
+        ON le.subject_id = c.subject_id
+       AND le.hadm_id    = c.hadm_id
+    WHERE le.itemid = 51222
+      AND le.valuenum IS NOT NULL
+      AND le.charttime >= (c.t0 - INTERVAL '24 hours')
+      AND le.charttime <= c.t0
+),
+hb_drop AS (
+    SELECT
+        stay_id,
+        MAX(running_max - hb_g_dl) AS hb_drop_max_24h
+    FROM (
+        SELECT
+            stay_id,
+            charttime,
+            hb_g_dl,
+            MAX(hb_g_dl) OVER (
+                PARTITION BY stay_id
+                ORDER BY charttime
+                ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+            ) AS running_max
+        FROM hb
+    ) x
+    GROUP BY stay_id
+)
+SELECT
+    s.stay_id,
+    COALESCE(d.hb_drop_max_24h, 0) AS hb_drop_max_24h
+FROM anticoagulant.sepsis_at_t0 s
+LEFT JOIN hb_drop d
+    ON d.stay_id = s.stay_id;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_hb_drop_pre_t0_stay_id
+    ON anticoagulant.hb_drop_pre_t0(stay_id);
+
+
+-- Step 1.4.3B (FIXED): RBC/PRBC transfusion events within 6h pre-t0
+-- Key fix: inputevents has no "label"; join mimiciv_icu.d_items to get label
+
+DROP TABLE IF EXISTS anticoagulant.rbc_events_pre_t0_6h;
+
+CREATE TABLE anticoagulant.rbc_events_pre_t0_6h AS
+WITH cohort AS (
+    SELECT stay_id, t0
+    FROM anticoagulant.sepsis_at_t0
+)
+SELECT
+    c.stay_id,
+    ie.starttime AS event_time,
+    ie.itemid,
+    di.label,
+    ie.amount,
+    ie.amountuom,
+    ie.rate,
+    ie.rateuom,
+    ie.ordercategoryname
+FROM cohort c
+INNER JOIN mimiciv_icu.inputevents ie
+    ON ie.stay_id = c.stay_id
+LEFT JOIN mimiciv_icu.d_items di
+    ON di.itemid = ie.itemid
+WHERE ie.starttime >= (c.t0 - INTERVAL '6 hours')
+  AND ie.starttime <= c.t0
+  AND di.label IS NOT NULL
+  AND (
+        lower(di.label) LIKE '%packed red%'
+     OR lower(di.label) LIKE '%prbc%'
+     OR lower(di.label) LIKE '%red blood cell%'
+     OR lower(di.label) LIKE '%rbc%'
+  );
+
+-- Index for downstream counting/join
+DROP INDEX IF EXISTS anticoagulant.idx_rbc_events_pre_t0_6h_stay_time;
+CREATE INDEX idx_rbc_events_pre_t0_6h_stay_time
+    ON anticoagulant.rbc_events_pre_t0_6h(stay_id, event_time);
+
+
+-- Step 1.4.3C
+ 
+DROP TABLE IF EXISTS anticoagulant.exclude_active_bleed_t0_flag;
+
+CREATE TABLE anticoagulant.exclude_active_bleed_t0_flag AS
+WITH rbc_cnt AS (
+    SELECT
+        stay_id,
+        COUNT(*) AS rbc_events_cnt_6h
+    FROM anticoagulant.rbc_events_pre_t0_6h
+    GROUP BY stay_id
+)
+SELECT
+    s.stay_id,
+    CASE
+        WHEN COALESCE(r.rbc_events_cnt_6h, 0) >= 2 THEN 1
+        WHEN COALESCE(r.rbc_events_cnt_6h, 0) >= 1 AND COALESCE(h.hb_drop_max_24h, 0) >= 2 THEN 1
+        ELSE 0
+    END AS exclude_active_bleed_t0_flag,
+
+    COALESCE(r.rbc_events_cnt_6h, 0) AS rbc_events_cnt_6h,
+    COALESCE(h.hb_drop_max_24h, 0)   AS hb_drop_max_24h,
+
+    CASE
+        WHEN COALESCE(r.rbc_events_cnt_6h, 0) >= 2 THEN 'RBC>=2 within 6h pre-t0'
+        WHEN COALESCE(r.rbc_events_cnt_6h, 0) >= 1 AND COALESCE(h.hb_drop_max_24h, 0) >= 2 THEN 'RBC>=1 within 6h AND Hb drop>=2 within 24h pre-t0'
+        ELSE NULL
+    END AS active_bleed_reason
+FROM anticoagulant.sepsis_at_t0 s
+LEFT JOIN rbc_cnt r
+    ON r.stay_id = s.stay_id
+LEFT JOIN anticoagulant.hb_drop_pre_t0 h
+    ON h.stay_id = s.stay_id;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_excl_active_bleed_t0_stay_id
+    ON anticoagulant.exclude_active_bleed_t0_flag(stay_id);
+
+
+
+
+-- 各排除原因的人数
+SELECT
+  SUM(exclude_therapeutic_anticoag_flag) AS n_excl_thera_anticoag,
+  SUM(exclude_vte_pre_t0_flag)           AS n_excl_vte_pre_t0,
+  SUM(exclude_active_bleed_t0_flag)      AS n_excl_active_bleed_t0
+FROM (
+  SELECT
+    s.stay_id,
+    t.exclude_therapeutic_anticoag_flag,
+    v.exclude_vte_pre_t0_flag,
+    b.exclude_active_bleed_t0_flag
+  FROM anticoagulant.sepsis_at_t0 s
+  LEFT JOIN anticoagulant.exclude_therapeutic_anticoag_flag t ON t.stay_id = s.stay_id
+  LEFT JOIN anticoagulant.exclude_vte_pre_t0_flag v           ON v.stay_id = s.stay_id
+  LEFT JOIN anticoagulant.exclude_active_bleed_t0_flag b      ON b.stay_id = s.stay_id
+) x;
+
+-- 交叉重叠（方便看是否某一条规则“吞掉”过多）
+SELECT
+  t.exclude_therapeutic_anticoag_flag,
+  v.exclude_vte_pre_t0_flag,
+  b.exclude_active_bleed_t0_flag,
+  COUNT(*) AS n
+FROM anticoagulant.sepsis_at_t0 s
+LEFT JOIN anticoagulant.exclude_therapeutic_anticoag_flag t ON t.stay_id = s.stay_id
+LEFT JOIN anticoagulant.exclude_vte_pre_t0_flag v           ON v.stay_id = s.stay_id
+LEFT JOIN anticoagulant.exclude_active_bleed_t0_flag b      ON b.stay_id = s.stay_id
+GROUP BY 1,2,3
+ORDER BY n DESC;
+
+
+
+
+SELECT COUNT(*) AS n_rbc_events FROM anticoagulant.rbc_events_pre_t0_6h;
+
+SELECT di_label, n
+FROM (
+  SELECT label AS di_label, COUNT(*) AS n
+  FROM anticoagulant.rbc_events_pre_t0_6h
+  GROUP BY label
+) x
+ORDER BY n DESC
+LIMIT 30;
+                                                                                                                                                        
+
+
+ --step1.6A 
+DROP VIEW IF EXISTS anticoagulant.radiology_src;
+
+CREATE VIEW anticoagulant.radiology_src AS
+SELECT
+  note_id::text       AS note_id,        
+  subject_id::int     AS subject_id,
+  hadm_id::int        AS hadm_id,
+  COALESCE(charttime, storetime)::timestamp AS note_time,
+  charttime::timestamp AS charttime,
+  storetime::timestamp AS storetime,
+  text::text          AS report_text,
+  note_type::text     AS note_type,
+  note_seq::int       AS note_seq
+FROM mimiciv_note.radiology
+WHERE text IS NOT NULL
+  AND COALESCE(charttime, storetime) IS NOT NULL;
+
+
+ 
+
+ --step1.6B  
+DROP TABLE IF EXISTS anticoagulant.radiology_notes_cohort;
+
+CREATE TABLE anticoagulant.radiology_notes_cohort AS
+WITH cohort AS (
+  SELECT
+    s.subject_id,
+    s.hadm_id,
+    s.stay_id,
+    b.admittime,
+    b.dischtime
+  FROM anticoagulant.sepsis_at_t0 s
+  JOIN anticoagulant.base_first_stay b
+    ON b.stay_id = s.stay_id
+)
+SELECT
+  c.stay_id,
+  c.subject_id,
+  c.hadm_id,
+  r.note_id,          -- text
+  r.note_time,
+  r.charttime,
+  r.storetime,
+  r.report_text,
+  r.note_type,
+  r.note_seq
+FROM cohort c
+JOIN anticoagulant.radiology_src r
+  ON r.subject_id = c.subject_id
+ AND r.hadm_id    = c.hadm_id
+ AND r.note_time >= c.admittime
+ AND r.note_time <= c.dischtime;
+
+CREATE INDEX IF NOT EXISTS idx_rad_notes_cohort_stay_time
+  ON anticoagulant.radiology_notes_cohort(stay_id, note_time);
+
+ANALYZE anticoagulant.radiology_notes_cohort;
+
+ --step1.6C 
+DROP TABLE IF EXISTS anticoagulant.vte_events_radiology;
+
+CREATE TABLE anticoagulant.vte_events_radiology AS
+WITH base AS (
+  SELECT
+    stay_id,
+    subject_id,
+    hadm_id,
+    note_id,
+    charttime AS event_time,
+    report_text
+  FROM anticoagulant.radiology_notes_cohort
+),
+sections AS (
+  SELECT
+    b.*,
+
+    -- 提取 Impression 段（直到下一个大写标题或文本结束）
+    (regexp_matches(
+      b.report_text,
+      '(?is)impression:\s*(.*?)(?:\n[A-Z][A-Z \t]{2,}:|\Z)'
+    ))[1] AS impression_section,
+
+    -- 提取 Conclusion 段
+    (regexp_matches(
+      b.report_text,
+      '(?is)conclusion:\s*(.*?)(?:\n[A-Z][A-Z \t]{2,}:|\Z)'
+    ))[1] AS conclusion_section
+  FROM base b
+),
+classified AS (
+  SELECT
+    *,
+    CASE
+      WHEN impression_section IS NOT NULL THEN impression_section
+      WHEN conclusion_section IS NOT NULL THEN conclusion_section
+      ELSE report_text
+    END AS search_text,
+    CASE
+      WHEN impression_section IS NOT NULL OR conclusion_section IS NOT NULL
+      THEN 'impression_or_conclusion'
+      ELSE 'full_report'
+    END AS section_used
+  FROM sections
+),
+flags AS (
+  SELECT
+    *,
+
+    -- PE 关键词：pulmonary embolism/PE/filling defect/pulmonary artery thrombus
+    (search_text ~* '(pulmonary\s+embol(ism|us)|\mpe\M|filling\s+defect|pulmonary\s+arter(y|ies)\s+(thrombus|thrombosis))') AS pe_pos,
+
+    -- DVT 关键词：DVT/deep vein thromb/venous thromb/thrombus/thrombosis
+    (search_text ~* '(deep\s+vein\s+thromb|\mdvt\M|venous\s+thromb|\bthrombus\b|\bthrombosis\b)') AS dvt_pos,
+
+    -- PE 否定/排除语境
+    (search_text ~* '(no\s+(evidence|sign)s?\s+of|without\s+(any\s+)?evidence\s+of|negative\s+for|not\s+seen|ruled\s+out|did\s+not\s+show)\s+(acute\s+)?(pulmonary\s+embol(ism|us)|\mpe\M|filling\s+defect)') AS pe_neg,
+    (search_text ~* '(rule\s*out|r/o)\s+(pulmonary\s+embol(ism|us)|\mpe\M)') AS pe_ruleout,
+
+    -- DVT 否定/排除语境
+    (search_text ~* '(no\s+(evidence|sign)s?\s+of|without\s+(any\s+)?evidence\s+of|negative\s+for|not\s+seen|ruled\s+out|did\s+not\s+show)\s+(acute\s+)?(deep\s+vein\s+thromb|\mdvt\M|venous\s+thromb)') AS dvt_neg,
+    (search_text ~* '(rule\s*out|r/o)\s+(deep\s+vein\s+thromb|\mdvt\M)') AS dvt_ruleout
+  FROM classified
+),
+events AS (
+  SELECT
+    stay_id, subject_id, hadm_id, note_id, event_time,
+    'PE'::text AS event_type,
+    section_used
+  FROM flags
+  WHERE pe_pos AND NOT pe_neg AND NOT pe_ruleout
+
+  UNION ALL
+
+  SELECT
+    stay_id, subject_id, hadm_id, note_id, event_time,
+    'DVT'::text AS event_type,
+    section_used
+  FROM flags
+  WHERE dvt_pos AND NOT dvt_neg AND NOT dvt_ruleout
+)
+SELECT * FROM events;
+
+CREATE INDEX IF NOT EXISTS idx_vte_events_rad_stay_time
+  ON anticoagulant.vte_events_radiology(stay_id, event_time);
+
+CREATE INDEX IF NOT EXISTS idx_vte_events_rad_type_time
+  ON anticoagulant.vte_events_radiology(event_type, event_time);
+
+ANALYZE anticoagulant.vte_events_radiology;
+                                               
+                                               
+                                               
+--step1.6D
+ DROP TABLE IF EXISTS anticoagulant.vte_radiology_qc_summary;
+
+CREATE TABLE anticoagulant.vte_radiology_qc_summary AS
+SELECT
+  COUNT(*) AS n_events_total,
+  SUM(CASE WHEN event_type='PE'  THEN 1 ELSE 0 END) AS n_pe,
+  SUM(CASE WHEN event_type='DVT' THEN 1 ELSE 0 END) AS n_dvt,
+  SUM(CASE WHEN section_used='impression_or_conclusion' THEN 1 ELSE 0 END) AS n_from_impr,
+  SUM(CASE WHEN section_used='full_report' THEN 1 ELSE 0 END) AS n_from_full
+FROM anticoagulant.vte_events_radiology;
+                                                                                                        
+                                                                                                        
+--step1.6E
+DROP TABLE IF EXISTS anticoagulant.vte_events_radiology_earliest;
+
+CREATE TABLE anticoagulant.vte_events_radiology_earliest AS
+SELECT
+  stay_id,
+  MIN(CASE WHEN event_type='PE'  THEN event_time END) AS first_pe_time,
+  MIN(CASE WHEN event_type='DVT' THEN event_time END) AS first_dvt_time,
+  MIN(event_time) AS first_vte_time
+FROM anticoagulant.vte_events_radiology
+GROUP BY stay_id;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_vte_earliest_stay_id
+  ON anticoagulant.vte_events_radiology_earliest(stay_id);
+ 
+ 
+ --step1.6F
+ DROP TABLE IF EXISTS anticoagulant.exclude_vte_pre_t0_flag;
+
+CREATE TABLE anticoagulant.exclude_vte_pre_t0_flag AS
+WITH pre_rad AS (
+  SELECT
+    s.stay_id,
+    MIN(e.event_time) AS first_radiology_vte_time_pre_t0
+  FROM anticoagulant.sepsis_at_t0 s
+  INNER JOIN anticoagulant.vte_events_radiology e
+    ON e.stay_id = s.stay_id
+   AND e.event_time <= s.t0
+  GROUP BY s.stay_id
+)
+SELECT
+  s.stay_id,
+
+  CASE WHEN pr.first_radiology_vte_time_pre_t0 IS NULL THEN 0 ELSE 1 END AS radiology_vte_pre_t0_flag,
+  pr.first_radiology_vte_time_pre_t0,
+
+  COALESCE(v.icd_vte_history_flag, 0) AS icd_vte_history_flag,
+  COALESCE(v.icd_vte_any_flag, 0)     AS icd_vte_any_flag,
+
+  CASE
+    WHEN pr.first_radiology_vte_time_pre_t0 IS NOT NULL THEN 1
+    WHEN COALESCE(v.icd_vte_history_flag, 0) = 1        THEN 1
+    ELSE 0
+  END AS exclude_vte_pre_t0_flag
+FROM anticoagulant.sepsis_at_t0 s
+LEFT JOIN pre_rad pr
+  ON pr.stay_id = s.stay_id
+LEFT JOIN anticoagulant.vte_icd_flags v
+  ON v.stay_id = s.stay_id;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_excl_vte_pre_t0_stay_id
+  ON anticoagulant.exclude_vte_pre_t0_flag(stay_id);
+
+  
+ --qc-- 
+-- 1) radiology 报告进入 cohort 的规模
+SELECT COUNT(*) AS n_rad_notes_cohort FROM anticoagulant.radiology_notes_cohort;
+
+-- 2) VTE 事件命中规模
+SELECT * FROM anticoagulant.vte_radiology_qc_summary;
+
+-- 3) t0 前 VTE 排除规模（最终版）
+SELECT
+  SUM(exclude_vte_pre_t0_flag)   AS n_excl_vte_pre_t0,
+  SUM(radiology_vte_pre_t0_flag) AS n_by_radiology_pre_t0,
+  SUM(icd_vte_history_flag)      AS n_by_icd_history
+FROM anticoagulant.exclude_vte_pre_t0_flag;
+                                                   
+                                                   
+--step1.5A
+DROP TABLE IF EXISTS anticoagulant.landmark_base_24h;
+
+CREATE TABLE anticoagulant.landmark_base_24h AS
+SELECT
+    s.subject_id,
+    s.hadm_id,
+    s.stay_id,
+    s.t0,
+    (s.t0 + INTERVAL '24 hours') AS tL,
+    s.sepsis_onset_time,
+
+    b.admittime,
+    b.dischtime,
+    b.deathtime,
+
+    -- tL 时仍在院：dischtime >= tL （如你希望更严格，可改成 >）
+    CASE
+        WHEN b.dischtime IS NOT NULL AND b.dischtime >= (s.t0 + INTERVAL '24 hours') THEN 1
+        ELSE 0
+    END AS in_hosp_at_tL_flag,
+
+    -- tL 时存活：deathtime 为空或在 tL 之后
+    CASE
+        WHEN b.deathtime IS NULL OR b.deathtime > (s.t0 + INTERVAL '24 hours') THEN 1
+        ELSE 0
+    END AS alive_at_tL_flag,
+
+    CASE
+        WHEN (b.dischtime IS NOT NULL AND b.dischtime >= (s.t0 + INTERVAL '24 hours'))
+         AND (b.deathtime IS NULL OR b.deathtime > (s.t0 + INTERVAL '24 hours'))
+        THEN 1 ELSE 0
+    END AS alive_in_hosp_at_tL_flag
+FROM anticoagulant.sepsis_at_t0 s
+INNER JOIN anticoagulant.base_first_stay b
+    ON b.stay_id = s.stay_id;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_landmark_base_24h_stay
+    ON anticoagulant.landmark_base_24h(stay_id);
+
+CREATE INDEX IF NOT EXISTS idx_landmark_base_24h_hadm
+    ON anticoagulant.landmark_base_24h(hadm_id);
+
+ANALYZE anticoagulant.landmark_base_24h;
+                                
+                                
+                                
+--step1.5B                                
+DROP TABLE IF EXISTS anticoagulant.death_in_grace_24h;
+
+CREATE TABLE anticoagulant.death_in_grace_24h AS
+SELECT
+    l.stay_id,
+    l.deathtime AS death_time,
+    CASE
+        WHEN l.deathtime IS NOT NULL AND l.deathtime > l.t0 AND l.deathtime <= l.tL THEN 1
+        ELSE 0
+    END AS death_in_grace_flag
+FROM anticoagulant.landmark_base_24h l;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_death_in_grace_24h_stay
+    ON anticoagulant.death_in_grace_24h(stay_id);
+                                            
+                                            
+                                            
+--step1.5C  
+DROP TABLE IF EXISTS anticoagulant.vte_events_radiology_timefix;
+
+CREATE TABLE anticoagulant.vte_events_radiology_timefix AS
+SELECT
+    e.stay_id,
+    e.subject_id,
+    e.hadm_id,
+    e.note_id,
+    COALESCE(e.event_time, r.note_time, r.storetime) AS event_time_fix,
+    e.event_type,
+    e.section_used
+FROM anticoagulant.vte_events_radiology e
+LEFT JOIN anticoagulant.radiology_notes_cohort r
+    ON r.stay_id = e.stay_id
+   AND r.note_id = e.note_id
+WHERE COALESCE(e.event_time, r.note_time, r.storetime) IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_vte_rad_timefix_stay_time
+    ON anticoagulant.vte_events_radiology_timefix(stay_id, event_time_fix);
+
+ANALYZE anticoagulant.vte_events_radiology_timefix;
+ 
+ 
+ 
+ DROP TABLE IF EXISTS anticoagulant.vte_in_grace_24h;
+
+CREATE TABLE anticoagulant.vte_in_grace_24h AS
+WITH hits AS (
+    SELECT
+        l.stay_id,
+        MIN(t.event_time_fix) AS first_vte_time_grace,
+        MIN(CASE WHEN t.event_type = 'PE'  THEN t.event_time_fix END) AS first_pe_time_grace,
+        MIN(CASE WHEN t.event_type = 'DVT' THEN t.event_time_fix END) AS first_dvt_time_grace
+    FROM anticoagulant.landmark_base_24h l
+    INNER JOIN anticoagulant.vte_events_radiology_timefix t
+        ON t.stay_id = l.stay_id
+       AND t.event_time_fix > l.t0
+       AND t.event_time_fix <= l.tL
+    GROUP BY l.stay_id
+)
+SELECT
+    l.stay_id,
+    CASE WHEN h.first_vte_time_grace IS NULL THEN 0 ELSE 1 END AS vte_in_grace_flag,
+    h.first_vte_time_grace,
+    h.first_pe_time_grace,
+    h.first_dvt_time_grace
+FROM anticoagulant.landmark_base_24h l
+LEFT JOIN hits h
+    ON h.stay_id = l.stay_id;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_vte_in_grace_24h_stay
+    ON anticoagulant.vte_in_grace_24h(stay_id);
+  
+  
+ ---Step 1.5D 
+DROP TABLE IF EXISTS anticoagulant.rbc_events_grace_24h;
+
+CREATE TABLE anticoagulant.rbc_events_grace_24h AS
+WITH cohort AS (
+    SELECT stay_id, t0, tL
+    FROM anticoagulant.landmark_base_24h
+)
+SELECT
+    c.stay_id,
+    ie.starttime AS event_time,
+    ie.itemid,
+    di.label,
+    ie.amount,
+    ie.amountuom
+FROM cohort c
+INNER JOIN mimiciv_icu.inputevents ie
+    ON ie.stay_id = c.stay_id
+INNER JOIN mimiciv_icu.d_items di
+    ON di.itemid = ie.itemid
+WHERE ie.starttime > c.t0
+  AND ie.starttime <= c.tL
+  AND di.label IS NOT NULL
+  AND (
+        lower(di.label) LIKE '%packed red%'
+     OR lower(di.label) LIKE '%prbc%'
+     OR lower(di.label) LIKE '%red blood cell%'
+     OR lower(di.label) LIKE '%rbc%'
+  )
+  -- 可选：去掉被重写/撤销的记录（不同版本字段值略有差异，可按需开启）
+  AND (ie.statusdescription IS NULL OR ie.statusdescription <> 'Rewrianticoagulantn');
+
+CREATE INDEX IF NOT EXISTS idx_rbc_events_grace_24h_stay_time
+    ON anticoagulant.rbc_events_grace_24h(stay_id, event_time);
+
+ANALYZE anticoagulant.rbc_events_grace_24h;
+
+
+
+DROP TABLE IF EXISTS anticoagulant.hb_drop_grace_24h;
+
+CREATE TABLE anticoagulant.hb_drop_grace_24h AS
+WITH cohort AS (
+    SELECT subject_id, hadm_id, stay_id, t0, tL
+    FROM anticoagulant.landmark_base_24h
+),
+hb AS (
+    SELECT
+        c.stay_id,
+        c.t0,
+        c.tL,
+        le.charttime,
+        le.valuenum::numeric AS hb_g_dl
+    FROM cohort c
+    INNER JOIN mimiciv_hosp.labevents le
+        ON le.subject_id = c.subject_id
+       AND le.hadm_id    = c.hadm_id
+    WHERE le.itemid = 51222
+      AND le.valuenum IS NOT NULL
+      -- 取 t0 前 24h 到 tL，保证能拿到 baseline（若存在）
+      AND le.charttime >= (c.t0 - INTERVAL '24 hours')
+      AND le.charttime <= c.tL
+),
+baseline AS (
+    -- baseline = 最后一条 Hb <= t0
+    SELECT DISTINCT ON (stay_id)
+        stay_id,
+        hb_g_dl AS hb_baseline,
+        charttime AS hb_baseline_time
+    FROM hb
+    WHERE charttime <= t0
+    ORDER BY stay_id, charttime DESC
+),
+-- 替换 1.5D-2 中的 min_after CTE
+min_after AS (
+    SELECT
+        x.stay_id,
+        x.hb_min_after,
+        y.charttime AS hb_min_after_time
+    FROM (
+        SELECT
+            stay_id,
+            MIN(hb_g_dl) AS hb_min_after
+        FROM hb
+        WHERE charttime > t0
+          AND charttime <= tL
+        GROUP BY stay_id
+    ) x
+    LEFT JOIN LATERAL (
+        SELECT charttime
+        FROM hb h2
+        WHERE h2.stay_id = x.stay_id
+          AND h2.charttime > h2.t0
+          AND h2.charttime <= h2.tL
+          AND h2.hb_g_dl = x.hb_min_after
+        ORDER BY charttime ASC
+        LIMIT 1
+    ) y ON TRUE
+)
+
+SELECT
+    l.stay_id,
+    b.hb_baseline,
+    b.hb_baseline_time,
+    m.hb_min_after,
+    m.hb_min_after_time,
+    CASE
+        WHEN b.hb_baseline IS NULL OR m.hb_min_after IS NULL THEN NULL
+        ELSE (b.hb_baseline - m.hb_min_after)
+    END AS hb_drop_grace
+FROM anticoagulant.landmark_base_24h l
+LEFT JOIN baseline b
+    ON b.stay_id = l.stay_id
+LEFT JOIN min_after m
+    ON m.stay_id = l.stay_id;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_hb_drop_grace_24h_stay
+    ON anticoagulant.hb_drop_grace_24h(stay_id);
+
+
+
+
+DROP TABLE IF EXISTS anticoagulant.major_bleed_in_grace_24h;
+
+CREATE TABLE anticoagulant.major_bleed_in_grace_24h AS
+WITH rbc_cnt AS (
+    SELECT
+        stay_id,
+        COUNT(*) AS rbc_events_cnt_grace,
+        MIN(event_time) AS first_rbc_time_grace
+    FROM anticoagulant.rbc_events_grace_24h
+    GROUP BY stay_id
+)
+SELECT
+    l.stay_id,
+    CASE
+        WHEN COALESCE(r.rbc_events_cnt_grace, 0) >= 2 THEN 1
+        WHEN COALESCE(r.rbc_events_cnt_grace, 0) >= 1
+         AND COALESCE(h.hb_drop_grace, 0) >= 2
+        THEN 1
+        ELSE 0
+    END AS major_bleed_in_grace_flag,
+
+    COALESCE(r.rbc_events_cnt_grace, 0) AS rbc_events_cnt_grace,
+    r.first_rbc_time_grace,
+    h.hb_baseline,
+    h.hb_baseline_time,
+    h.hb_min_after,
+    h.hb_min_after_time,
+    h.hb_drop_grace,
+
+    CASE
+        WHEN COALESCE(r.rbc_events_cnt_grace, 0) >= 2
+            THEN 'RBC>=2 within (t0,tL]'
+        WHEN COALESCE(r.rbc_events_cnt_grace, 0) >= 1
+         AND COALESCE(h.hb_drop_grace, 0) >= 2
+            THEN 'RBC>=1 within (t0,tL] AND Hb drop>=2 by tL'
+        ELSE NULL
+    END AS major_bleed_reason
+FROM anticoagulant.landmark_base_24h l
+LEFT JOIN rbc_cnt r
+    ON r.stay_id = l.stay_id
+LEFT JOIN anticoagulant.hb_drop_grace_24h h
+    ON h.stay_id = l.stay_id;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_major_bleed_in_grace_24h_stay
+    ON anticoagulant.major_bleed_in_grace_24h(stay_id);
+
+
+
+--step1.5E--
+DROP TABLE IF EXISTS anticoagulant.cohort_index;
+
+CREATE TABLE anticoagulant.cohort_index AS
+SELECT
+    l.subject_id,
+    l.hadm_id,
+    l.stay_id,
+    l.t0,
+    l.tL,
+    l.sepsis_onset_time,
+
+    -- Step 1.4 预排除
+    COALESCE(ta.exclude_therapeutic_anticoag_flag, 0) AS exclude_therapeutic_anticoag_flag,
+    COALESCE(v0.exclude_vte_pre_t0_flag, 0)           AS exclude_vte_pre_t0_flag,
+    COALESCE(ab.exclude_active_bleed_t0_flag, 0)      AS exclude_active_bleed_t0_flag,
+
+    -- Landmark 资格（tL 时仍在院且存活）
+    l.in_hosp_at_tL_flag,
+    l.alive_at_tL_flag,
+    l.alive_in_hosp_at_tL_flag,
+
+    -- grace window 排除（t0~tL 内事件）
+    COALESCE(dg.death_in_grace_flag, 0)               AS death_in_grace_flag,
+    dg.death_time,
+
+    COALESCE(vg.vte_in_grace_flag, 0)                 AS vte_in_grace_flag,
+    vg.first_vte_time_grace,
+    vg.first_pe_time_grace,
+    vg.first_dvt_time_grace,
+
+    COALESCE(bg.major_bleed_in_grace_flag, 0)         AS major_bleed_in_grace_flag,
+    bg.rbc_events_cnt_grace,
+    bg.first_rbc_time_grace,
+    bg.hb_drop_grace,
+    bg.major_bleed_reason,
+
+    -- 最终 landmark eligible
+    CASE
+        WHEN l.alive_in_hosp_at_tL_flag = 1
+         AND COALESCE(ta.exclude_therapeutic_anticoag_flag, 0) = 0
+         AND COALESCE(v0.exclude_vte_pre_t0_flag, 0)           = 0
+         AND COALESCE(ab.exclude_active_bleed_t0_flag, 0)      = 0
+         AND COALESCE(dg.death_in_grace_flag, 0)               = 0
+         AND COALESCE(vg.vte_in_grace_flag, 0)                 = 0
+         AND COALESCE(bg.major_bleed_in_grace_flag, 0)         = 0
+        THEN 1 ELSE 0
+    END AS landmark_eligible_flag
+FROM anticoagulant.landmark_base_24h l
+LEFT JOIN anticoagulant.exclude_therapeutic_anticoag_flag ta
+    ON ta.stay_id = l.stay_id
+LEFT JOIN anticoagulant.exclude_vte_pre_t0_flag v0
+    ON v0.stay_id = l.stay_id
+LEFT JOIN anticoagulant.exclude_active_bleed_t0_flag ab
+    ON ab.stay_id = l.stay_id
+LEFT JOIN anticoagulant.death_in_grace_24h dg
+    ON dg.stay_id = l.stay_id
+LEFT JOIN anticoagulant.vte_in_grace_24h vg
+    ON vg.stay_id = l.stay_id
+LEFT JOIN anticoagulant.major_bleed_in_grace_24h bg
+    ON bg.stay_id = l.stay_id;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_cohort_index_stay
+    ON anticoagulant.cohort_index(stay_id);
+
+CREATE INDEX IF NOT EXISTS idx_cohort_index_eligible
+    ON anticoagulant.cohort_index(landmark_eligible_flag);
+
+ANALYZE anticoagulant.cohort_index;
+
+
+/*====================================================================
+ Step 1.7A–1.7E  Exposure extraction (prophylactic anticoagulation)
+ Window: [t0, tL] where tL = t0 + 24h (from anticoagulant.cohort_index)
+ Treat=1 if prophylactic LMWH or UFH in window:
+   - LMWH: max single dose <= 40 mg AND total <= 80 mg within 24h
+   - UFH: SC total <= 15000 units within 24h
+ Exclude flush/lock; do not count IV/infusion as prophylaxis
+ Priority data source: eMAR; fallback: prescriptions
+====================================================================*/
+
+------------------------------
+-- Step 1.7A cohort eligible
+------------------------------
+DROP TABLE IF EXISTS anticoagulant.cohort_landmark_eligible;
+
+CREATE TABLE anticoagulant.cohort_landmark_eligible AS
+SELECT
+  stay_id::bigint      AS stay_id,
+  subject_id::int      AS subject_id,
+  hadm_id::int         AS hadm_id,
+  t0::timestamp        AS t0,
+  tL::timestamp        AS tL
+FROM anticoagulant.cohort_index
+WHERE landmark_eligible_flag = 1;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_cohort_lm_elig_stay
+  ON anticoagulant.cohort_landmark_eligible(stay_id);
+
+CREATE INDEX IF NOT EXISTS idx_cohort_lm_elig_subj_hadm
+  ON anticoagulant.cohort_landmark_eligible(subject_id, hadm_id);
+
+ANALYZE anticoagulant.cohort_landmark_eligible;
+
+
+------------------------------------------------------------
+-- Step 1.7B-1 (optimized) filtered eMAR administrations
+------------------------------------------------------------
+DROP TABLE IF EXISTS anticoagulant.emar_anticoag_admin_24h;
+
+CREATE UNLOGGED TABLE anticoagulant.emar_anticoag_admin_24h AS
+WITH bounds AS (
+  SELECT MIN(t0) AS min_t0, MAX(tL) AS max_tL
+  FROM anticoagulant.cohort_landmark_eligible
+),
+cohort AS (
+  SELECT * FROM anticoagulant.cohort_landmark_eligible
+)
+SELECT
+  c.stay_id,
+  c.subject_id,
+  c.hadm_id,
+  e.emar_id,
+  e.emar_seq,
+  e.pharmacy_id,
+  e.charttime::timestamp                  AS event_time,
+  lower(trim(e.medication))               AS med_name,
+  lower(trim(coalesce(e.event_txt, '')))  AS event_txt
+FROM cohort c
+JOIN mimiciv_hosp.emar e
+  ON e.subject_id = c.subject_id
+ AND e.hadm_id    = c.hadm_id
+JOIN bounds b
+  ON e.charttime >= b.min_t0
+ AND e.charttime <= b.max_tL
+WHERE e.charttime >= c.t0
+  AND e.charttime <= c.tL
+  AND e.charttime IS NOT NULL
+  AND e.medication IS NOT NULL
+
+  -- keep "given/administered" only
+  AND lower(coalesce(e.event_txt, '')) ~ '(given|administered)'
+  AND lower(coalesce(e.event_txt, '')) !~ '(not given|held|refused|stopped|canceled|defer|omianticoagulantd|missed)'
+
+  -- drop flush/lock early
+  AND lower(e.medication) !~ '(flush|lock)'
+
+  -- anticoag related meds
+  AND (
+       e.medication ILIKE '%heparin%'
+    OR e.medication ILIKE '%enoxaparin%'
+    OR e.medication ILIKE '%lovenox%'
+    OR e.medication ILIKE '%dalteparin%'
+    OR e.medication ILIKE '%fragmin%'
+    OR e.medication ILIKE '%tinzaparin%'
+    OR e.medication ILIKE '%warfarin%'
+    OR e.medication ILIKE '%apixaban%' OR e.medication ILIKE '%eliquis%'
+    OR e.medication ILIKE '%rivaroxaban%' OR e.medication ILIKE '%xarelto%'
+    OR e.medication ILIKE '%dabigatran%' OR e.medication ILIKE '%pradaxa%'
+    OR e.medication ILIKE '%edoxaban%'
+    OR e.medication ILIKE '%fondaparinux%'
+    OR e.medication ILIKE '%argatroban%'
+    OR e.medication ILIKE '%bivalirudin%'
+  );
+
+CREATE INDEX IF NOT EXISTS idx_emar_admin_24h_key
+  ON anticoagulant.emar_anticoag_admin_24h(emar_id, emar_seq);
+
+CREATE INDEX IF NOT EXISTS idx_emar_admin_24h_stay_time
+  ON anticoagulant.emar_anticoag_admin_24h(stay_id, event_time);
+
+ANALYZE anticoagulant.emar_anticoag_admin_24h;
+
+
+------------------------------------------------------------
+-- Step 1.7B-2 build standardized eMAR anticoag events
+-- NOTE: emar_detail has NO subject_id/hadm_id; join via (emar_id, emar_seq)
+------------------------------------------------------------
+DROP TABLE IF EXISTS anticoagulant.anticoag_emar_events_24h;
+
+CREATE UNLOGGED TABLE anticoagulant.anticoag_emar_events_24h AS
+WITH keys AS (
+  SELECT DISTINCT emar_id, emar_seq
+  FROM anticoagulant.emar_anticoag_admin_24h
+),
+detail AS (
+  SELECT
+    d.emar_id,
+    d.emar_seq,
+    d.pharmacy_id,
+    lower(trim(coalesce(d.route, '')))               AS route,
+    lower(trim(coalesce(d.administration_type, ''))) AS administration_type,
+    d.infusion_rate,
+
+    /* 剂量：dose_given 优先，其次 dose_due */
+    CASE
+      WHEN d.dose_given IS NOT NULL AND trim(d.dose_given::text) <> '' THEN 0
+      WHEN d.dose_due   IS NOT NULL AND trim(d.dose_due::text)   <> '' THEN 1
+      ELSE 9
+    END AS dose_src_rank,
+
+    NULLIF(
+      regexp_replace(
+        replace(
+          COALESCE(
+            NULLIF(trim(d.dose_given::text), ''),
+            NULLIF(trim(d.dose_due::text),   '')
+          ),
+          ',', ''
+        ),
+        '[^0-9\.]+', '', 'g'
+      ),
+      ''
+    )::numeric AS dose_val,
+
+    lower(trim(COALESCE(
+      NULLIF(trim(d.dose_given_unit::text), ''),
+      NULLIF(trim(d.dose_due_unit::text),   ''),
+      ''
+    ))) AS dose_unit
+
+  FROM mimiciv_hosp.emar_detail d
+  JOIN keys k
+    ON k.emar_id  = d.emar_id
+   AND k.emar_seq = d.emar_seq
+),
+dose_pick AS (
+  SELECT DISTINCT ON (emar_id, emar_seq)
+    emar_id,
+    emar_seq,
+    pharmacy_id,
+    dose_val,
+    dose_unit
+  FROM detail
+  WHERE dose_val IS NOT NULL
+  ORDER BY emar_id, emar_seq, dose_src_rank ASC, dose_val DESC NULLS LAST
+),
+route_agg AS (
+  SELECT
+    emar_id,
+    emar_seq,
+    MAX(pharmacy_id) AS pharmacy_id_any,
+
+    MAX(CASE
+          WHEN route LIKE '%sub%' OR route IN ('sc','sq','subq','sub-q','subcutaneous')
+          THEN 1 ELSE 0
+        END) AS has_sc,
+
+    MAX(CASE
+          WHEN route LIKE '%iv%' OR route LIKE '%intraven%'
+          THEN 1 ELSE 0
+        END) AS has_iv,
+
+    MAX(CASE
+          WHEN administration_type LIKE '%infusion%'
+          THEN 1 ELSE 0
+        END) AS has_inf_type,
+
+    MAX(CASE
+          WHEN infusion_rate IS NOT NULL
+          THEN 1 ELSE 0
+        END) AS has_inf_rate,
+
+    MAX(NULLIF(route,'')) AS route_any
+  FROM detail
+  GROUP BY emar_id, emar_seq
+),
+detail_best AS (
+  SELECT
+    r.emar_id,
+    r.emar_seq,
+    COALESCE(dp.pharmacy_id, r.pharmacy_id_any) AS pharmacy_id,
+    COALESCE(r.route_any, '') AS route,
+
+    CASE
+      WHEN (r.has_iv=1 OR r.has_inf_type=1 OR r.has_inf_rate=1) THEN 1 ELSE 0
+    END AS is_iv_or_infusion,
+
+    /* 关键：只要任一行提示 SC 就当 SC；
+       若 route 缺失且没有 IV/infusion 证据，则按“未知但非输注”计入 SC（否则会继续全 0） */
+    CASE
+      WHEN r.has_sc = 1 THEN 1
+      WHEN COALESCE(r.route_any,'') = '' AND (r.has_iv=0 AND r.has_inf_type=0 AND r.has_inf_rate=0) THEN 1
+      ELSE 0
+    END AS is_sc,
+
+    dp.dose_val,
+    dp.dose_unit
+  FROM route_agg r
+  LEFT JOIN dose_pick dp
+    ON dp.emar_id = r.emar_id AND dp.emar_seq = r.emar_seq
+),
+joined AS (
+  SELECT
+    a.stay_id,
+    a.subject_id,
+    a.hadm_id,
+    a.event_time,
+    a.med_name,
+    a.event_txt,
+    db.route,
+    db.is_sc,
+    db.is_iv_or_infusion,
+    db.dose_val,
+    db.dose_unit,
+    CASE
+      WHEN a.med_name LIKE '%enoxaparin%' OR a.med_name LIKE '%lovenox%'
+        OR a.med_name LIKE '%dalteparin%' OR a.med_name LIKE '%fragmin%'
+        OR a.med_name LIKE '%tinzaparin%'
+      THEN 'LMWH'
+      WHEN a.med_name LIKE '%heparin%'
+        AND a.med_name NOT LIKE '%enoxaparin%'
+        AND a.med_name NOT LIKE '%dalteparin%'
+        AND a.med_name NOT LIKE '%tinzaparin%'
+      THEN 'UFH'
+      WHEN a.med_name LIKE '%warfarin%'
+        OR a.med_name LIKE '%apixaban%' OR a.med_name LIKE '%eliquis%'
+        OR a.med_name LIKE '%rivaroxaban%' OR a.med_name LIKE '%xarelto%'
+        OR a.med_name LIKE '%dabigatran%' OR a.med_name LIKE '%pradaxa%'
+        OR a.med_name LIKE '%edoxaban%'
+        OR a.med_name LIKE '%fondaparinux%'
+        OR a.med_name LIKE '%argatroban%'
+        OR a.med_name LIKE '%bivalirudin%'
+      THEN 'OTHER_ANTICOAG'
+      ELSE NULL
+    END AS anticoag_type
+  FROM anticoagulant.emar_anticoag_admin_24h a
+  JOIN detail_best db
+    ON db.emar_id  = a.emar_id
+   AND db.emar_seq = a.emar_seq
+   AND (db.pharmacy_id = a.pharmacy_id OR db.pharmacy_id IS NULL OR a.pharmacy_id IS NULL)
+)
+SELECT
+  stay_id, subject_id, hadm_id, event_time,
+  med_name, event_txt,
+  route,
+  anticoag_type,
+  1 AS is_given,
+  0 AS is_flush,
+  is_sc,
+  is_iv_or_infusion,
+  dose_val,
+  dose_unit,
+  CASE
+    WHEN anticoag_type='LMWH' AND dose_val IS NOT NULL AND dose_unit LIKE '%mg%' THEN dose_val
+    WHEN anticoag_type='LMWH' AND dose_val IS NOT NULL AND dose_unit LIKE '%g%'  THEN dose_val * 1000
+    ELSE NULL
+  END AS dose_mg,
+  CASE
+    WHEN anticoag_type='UFH' AND dose_val IS NOT NULL
+     AND (dose_unit LIKE '%unit%' OR dose_unit IN ('u','iu','units','unit'))
+    THEN dose_val
+    ELSE NULL
+  END AS dose_u
+FROM joined;
+
+CREATE INDEX IF NOT EXISTS idx_emar_anticoag_stay_time
+  ON anticoagulant.anticoag_emar_events_24h(stay_id, event_time);
+
+CREATE INDEX IF NOT EXISTS idx_emar_anticoag_type
+  ON anticoagulant.anticoag_emar_events_24h(anticoag_type);
+
+ANALYZE anticoagulant.anticoag_emar_events_24h;
+
+
+
+------------------------------------------------------------
+-- Step 1.7C prescriptions fallback events (standardized)
+------------------------------------------------------------
+DROP TABLE IF EXISTS anticoagulant.anticoag_rx_events_24h;
+
+CREATE UNLOGGED TABLE anticoagulant.anticoag_rx_events_24h AS
+WITH bounds AS (
+  SELECT MIN(t0) AS min_t0, MAX(tL) AS max_tL
+  FROM anticoagulant.cohort_landmark_eligible
+),
+cohort AS (
+  SELECT * FROM anticoagulant.cohort_landmark_eligible
+),
+src AS (
+  SELECT
+    c.stay_id,
+    c.subject_id,
+    c.hadm_id,
+    p.starttime::timestamp                    AS event_time,
+    lower(trim(coalesce(p.drug, '')))         AS med_name,
+    lower(trim(coalesce(p.route, '')))        AS route,
+    NULLIF(
+      regexp_replace(
+        replace(coalesce(p.dose_val_rx, ''), ',', ''),
+        '[^0-9\.]+', '', 'g'
+      ),
+      ''
+    )::numeric                                AS dose_val,
+    lower(trim(coalesce(p.dose_unit_rx, '')))  AS dose_unit
+  FROM cohort c
+  JOIN mimiciv_hosp.prescriptions p
+    ON p.subject_id = c.subject_id
+   AND p.hadm_id    = c.hadm_id
+  JOIN bounds b
+    ON p.starttime >= b.min_t0
+   AND p.starttime <= b.max_tL
+  WHERE p.starttime >= c.t0
+    AND p.starttime <= c.tL
+    AND p.starttime IS NOT NULL
+    AND p.drug IS NOT NULL
+
+    AND lower(p.drug) !~ '(flush|lock)'
+
+    AND (
+         p.drug ILIKE '%heparin%'
+      OR p.drug ILIKE '%enoxaparin%'
+      OR p.drug ILIKE '%lovenox%'
+      OR p.drug ILIKE '%dalteparin%'
+      OR p.drug ILIKE '%fragmin%'
+      OR p.drug ILIKE '%tinzaparin%'
+      OR p.drug ILIKE '%warfarin%'
+      OR p.drug ILIKE '%apixaban%' OR p.drug ILIKE '%eliquis%'
+      OR p.drug ILIKE '%rivaroxaban%' OR p.drug ILIKE '%xarelto%'
+      OR p.drug ILIKE '%dabigatran%' OR p.drug ILIKE '%pradaxa%'
+      OR p.drug ILIKE '%edoxaban%'
+      OR p.drug ILIKE '%fondaparinux%'
+      OR p.drug ILIKE '%argatroban%'
+      OR p.drug ILIKE '%bivalirudin%'
+    )
+),
+kept AS (
+  SELECT
+    *,
+
+    0 AS is_flush,
+
+    CASE
+      WHEN route LIKE '%sub%' OR route IN ('sc','sq','subq','sub-q') THEN 1 ELSE 0
+    END AS is_sc,
+
+    CASE
+      WHEN route LIKE '%iv%' OR route LIKE '%intraven%' OR med_name LIKE '%infusion%' OR med_name LIKE '%drip%'
+      THEN 1 ELSE 0
+    END AS is_iv_or_infusion,
+
+    CASE
+      WHEN med_name LIKE '%enoxaparin%' OR med_name LIKE '%lovenox%'
+        OR med_name LIKE '%dalteparin%' OR med_name LIKE '%fragmin%'
+        OR med_name LIKE '%tinzaparin%'
+      THEN 'LMWH'
+      WHEN med_name LIKE '%heparin%'
+        AND med_name NOT LIKE '%enoxaparin%'
+        AND med_name NOT LIKE '%dalteparin%'
+        AND med_name NOT LIKE '%tinzaparin%'
+      THEN 'UFH'
+      WHEN med_name LIKE '%warfarin%'
+        OR med_name LIKE '%apixaban%' OR med_name LIKE '%eliquis%'
+        OR med_name LIKE '%rivaroxaban%' OR med_name LIKE '%xarelto%'
+        OR med_name LIKE '%dabigatran%' OR med_name LIKE '%pradaxa%'
+        OR med_name LIKE '%edoxaban%'
+        OR med_name LIKE '%fondaparinux%'
+        OR med_name LIKE '%argatroban%'
+        OR med_name LIKE '%bivalirudin%'
+      THEN 'OTHER_ANTICOAG'
+      ELSE NULL
+    END AS anticoag_type
+  FROM src
+)
+SELECT
+  stay_id, subject_id, hadm_id, event_time,
+  med_name, route,
+  anticoag_type,
+  is_flush, is_sc, is_iv_or_infusion,
+  dose_val, dose_unit,
+  CASE
+    WHEN anticoag_type = 'LMWH' AND dose_val IS NOT NULL AND dose_unit LIKE '%mg%' THEN dose_val
+    WHEN anticoag_type = 'LMWH' AND dose_val IS NOT NULL AND dose_unit LIKE '%g%'  THEN dose_val * 1000
+    ELSE NULL
+  END AS dose_mg,
+  CASE
+    WHEN anticoag_type = 'UFH' AND dose_val IS NOT NULL
+     AND (dose_unit LIKE '%unit%' OR dose_unit IN ('u','iu','units','unit'))
+    THEN dose_val
+    ELSE NULL
+  END AS dose_u
+FROM kept;
+
+CREATE INDEX IF NOT EXISTS idx_rx_anticoag_stay_time
+  ON anticoagulant.anticoag_rx_events_24h(stay_id, event_time);
+
+CREATE INDEX IF NOT EXISTS idx_rx_anticoag_type
+  ON anticoagulant.anticoag_rx_events_24h(anticoag_type);
+
+ANALYZE anticoagulant.anticoag_rx_events_24h;
+
+
+------------------------------------------------------------
+-- Step 1.7D exposure_24h aggregation (prefer eMAR else Rx)
+------------------------------------------------------------
+DROP TABLE IF EXISTS anticoagulant.exposure_24h;
+
+CREATE TABLE anticoagulant.exposure_24h AS
+WITH ae AS (
+  SELECT
+    stay_id,
+    MAX(CASE WHEN anticoag_type IS NOT NULL AND is_flush = 0 THEN 1 ELSE 0 END) AS any_anticoag_window_flag,
+    MAX(CASE WHEN anticoag_type = 'OTHER_ANTICOAG' AND is_flush = 0 THEN 1 ELSE 0 END) AS any_other_anticoag_flag,
+    MAX(CASE WHEN is_iv_or_infusion = 1 AND anticoag_type IS NOT NULL AND is_flush = 0 THEN 1 ELSE 0 END) AS any_iv_or_infusion_flag,
+
+    COUNT(*) FILTER (WHERE anticoag_type='LMWH' AND is_flush=0 AND is_sc=1 AND dose_mg IS NOT NULL) AS lmwh_n,
+    MIN(event_time) FILTER (WHERE anticoag_type='LMWH' AND is_flush=0 AND is_sc=1 AND dose_mg IS NOT NULL) AS first_lmwh_time,
+    MAX(dose_mg)  FILTER (WHERE anticoag_type='LMWH' AND is_flush=0 AND is_sc=1 AND dose_mg IS NOT NULL) AS lmwh_max_single_mg,
+    SUM(dose_mg)  FILTER (WHERE anticoag_type='LMWH' AND is_flush=0 AND is_sc=1 AND dose_mg IS NOT NULL) AS lmwh_total_mg,
+
+    COUNT(*) FILTER (WHERE anticoag_type='UFH' AND is_flush=0 AND is_sc=1 AND dose_u IS NOT NULL) AS ufh_n,
+    MIN(event_time) FILTER (WHERE anticoag_type='UFH' AND is_flush=0 AND is_sc=1 AND dose_u IS NOT NULL) AS first_ufh_time,
+    MAX(dose_u)  FILTER (WHERE anticoag_type='UFH' AND is_flush=0 AND is_sc=1 AND dose_u IS NOT NULL) AS ufh_max_single_u,
+    SUM(dose_u)  FILTER (WHERE anticoag_type='UFH' AND is_flush=0 AND is_sc=1 AND dose_u IS NOT NULL) AS ufh_total_u
+  FROM anticoagulant.anticoag_emar_events_24h
+  GROUP BY stay_id
+),
+ar AS (
+  SELECT
+    stay_id,
+    MAX(CASE WHEN anticoag_type IS NOT NULL AND is_flush = 0 THEN 1 ELSE 0 END) AS any_anticoag_window_flag,
+    MAX(CASE WHEN anticoag_type = 'OTHER_ANTICOAG' AND is_flush = 0 THEN 1 ELSE 0 END) AS any_other_anticoag_flag,
+    MAX(CASE WHEN is_iv_or_infusion = 1 AND anticoag_type IS NOT NULL AND is_flush = 0 THEN 1 ELSE 0 END) AS any_iv_or_infusion_flag,
+
+    COUNT(*) FILTER (WHERE anticoag_type='LMWH' AND is_flush=0 AND is_sc=1 AND dose_mg IS NOT NULL) AS lmwh_n,
+    MIN(event_time) FILTER (WHERE anticoag_type='LMWH' AND is_flush=0 AND is_sc=1 AND dose_mg IS NOT NULL) AS first_lmwh_time,
+    MAX(dose_mg)  FILTER (WHERE anticoag_type='LMWH' AND is_flush=0 AND is_sc=1 AND dose_mg IS NOT NULL) AS lmwh_max_single_mg,
+    SUM(dose_mg)  FILTER (WHERE anticoag_type='LMWH' AND is_flush=0 AND is_sc=1 AND dose_mg IS NOT NULL) AS lmwh_total_mg,
+
+    COUNT(*) FILTER (WHERE anticoag_type='UFH' AND is_flush=0 AND is_sc=1 AND dose_u IS NOT NULL) AS ufh_n,
+    MIN(event_time) FILTER (WHERE anticoag_type='UFH' AND is_flush=0 AND is_sc=1 AND dose_u IS NOT NULL) AS first_ufh_time,
+    MAX(dose_u)  FILTER (WHERE anticoag_type='UFH' AND is_flush=0 AND is_sc=1 AND dose_u IS NOT NULL) AS ufh_max_single_u,
+    SUM(dose_u)  FILTER (WHERE anticoag_type='UFH' AND is_flush=0 AND is_sc=1 AND dose_u IS NOT NULL) AS ufh_total_u
+  FROM anticoagulant.anticoag_rx_events_24h
+  GROUP BY stay_id
+),
+base AS (
+  SELECT
+    c.stay_id, c.subject_id, c.hadm_id, c.t0, c.tL,
+
+    CASE
+      WHEN ae.stay_id IS NOT NULL THEN 'EMAR'
+      WHEN ar.stay_id IS NOT NULL THEN 'PRESCRIPTIONS'
+      ELSE 'NONE'
+    END AS source_used,
+
+    COALESCE(ae.any_anticoag_window_flag, ar.any_anticoag_window_flag, 0) AS any_anticoag_window_flag,
+    COALESCE(ae.any_other_anticoag_flag,  ar.any_other_anticoag_flag,  0) AS any_other_anticoag_flag,
+    COALESCE(ae.any_iv_or_infusion_flag,  ar.any_iv_or_infusion_flag,  0) AS any_iv_or_infusion_flag,
+
+    COALESCE(ae.lmwh_n, 0)              AS lmwh_n,
+    COALESCE(ae.first_lmwh_time, ar.first_lmwh_time) AS first_lmwh_time,
+    COALESCE(ae.lmwh_max_single_mg, ar.lmwh_max_single_mg) AS lmwh_max_single_mg,
+    COALESCE(ae.lmwh_total_mg, 0)      AS lmwh_total_mg,
+
+    COALESCE(ae.ufh_n, 0)              AS ufh_n,
+    COALESCE(ae.first_ufh_time, ar.first_ufh_time) AS first_ufh_time,
+    COALESCE(ae.ufh_max_single_u, ar.ufh_max_single_u) AS ufh_max_single_u,
+    COALESCE(ae.ufh_total_u, 0)        AS ufh_total_u
+  FROM anticoagulant.cohort_landmark_eligible c
+  LEFT JOIN ae ON ae.stay_id = c.stay_id
+  LEFT JOIN ar ON ar.stay_id = c.stay_id AND ae.stay_id IS NULL
+),
+final AS (
+  SELECT
+    *,
+    CASE
+      WHEN lmwh_n > 0
+       AND lmwh_max_single_mg IS NOT NULL
+       AND lmwh_max_single_mg <= 40
+       AND lmwh_total_mg <= 80
+      THEN 1 ELSE 0
+    END AS lmwh_prophy_flag,
+    CASE
+      WHEN ufh_n > 0
+       AND ufh_total_u <= 15000
+      THEN 1 ELSE 0
+    END AS ufh_prophy_flag
+  FROM base
+)
+SELECT
+  stay_id, subject_id, hadm_id, t0, tL,
+  source_used,
+
+  CASE WHEN (lmwh_prophy_flag = 1 OR ufh_prophy_flag = 1) THEN 1 ELSE 0 END AS treat,
+
+  CASE
+    WHEN (lmwh_prophy_flag = 1 OR ufh_prophy_flag = 1) THEN 'A_prophylactic'
+    WHEN any_anticoag_window_flag = 0 THEN 'B_none'
+    ELSE 'X_other_anticoag_or_nonprophy'
+  END AS exposure_group,
+
+  CASE
+    WHEN (lmwh_prophy_flag = 1 AND ufh_prophy_flag = 0) THEN 'LMWH'
+    WHEN (lmwh_prophy_flag = 0 AND ufh_prophy_flag = 1) THEN 'UFH'
+    WHEN (lmwh_prophy_flag = 1 AND ufh_prophy_flag = 1) THEN 'MIXED'
+    ELSE 'NONE'
+  END AS prophy_type,
+
+  CASE
+    WHEN first_lmwh_time IS NOT NULL AND first_ufh_time IS NOT NULL THEN LEAST(first_lmwh_time, first_ufh_time)
+    WHEN first_lmwh_time IS NOT NULL THEN first_lmwh_time
+    WHEN first_ufh_time IS NOT NULL THEN first_ufh_time
+    ELSE NULL
+  END AS first_prophy_time,
+
+  lmwh_n, lmwh_max_single_mg, lmwh_total_mg,
+  ufh_n,  ufh_max_single_u,  ufh_total_u,
+  any_other_anticoag_flag,
+  any_iv_or_infusion_flag,
+  any_anticoag_window_flag
+FROM final;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_exposure24h_stay
+  ON anticoagulant.exposure_24h(stay_id);
+
+CREATE INDEX IF NOT EXISTS idx_exposure24h_treat
+  ON anticoagulant.exposure_24h(treat);
+
+ANALYZE anticoagulant.exposure_24h;
+
+
+------------------------------------------------------------
+-- Step 1.7E QC summary
+------------------------------------------------------------
+DROP TABLE IF EXISTS anticoagulant.exposure_24h_qc_summary;
+
+CREATE TABLE anticoagulant.exposure_24h_qc_summary AS
+SELECT
+  COUNT(*) AS n_total,
+  SUM(CASE WHEN treat=1 THEN 1 ELSE 0 END) AS n_treat,
+  SUM(CASE WHEN exposure_group='B_none' THEN 1 ELSE 0 END) AS n_control_none,
+  SUM(CASE WHEN exposure_group LIKE 'X_%' THEN 1 ELSE 0 END) AS n_x_other,
+  SUM(CASE WHEN prophy_type='LMWH' THEN 1 ELSE 0 END) AS n_lmwh,
+  SUM(CASE WHEN prophy_type='UFH'  THEN 1 ELSE 0 END) AS n_ufh,
+  SUM(CASE WHEN prophy_type='MIXED' THEN 1 ELSE 0 END) AS n_mixed,
+  SUM(CASE WHEN any_other_anticoag_flag=1 THEN 1 ELSE 0 END) AS n_any_other_anticoag,
+  SUM(CASE WHEN any_iv_or_infusion_flag=1 THEN 1 ELSE 0 END) AS n_any_iv_infusion
+FROM anticoagulant.exposure_24h;
+
+ANALYZE anticoagulant.exposure_24h_qc_summary;
+
+
+
+
+
+
+
+----1.8A
+DROP TABLE IF EXISTS anticoagulant.cohort_baseline_base;
+
+CREATE TABLE anticoagulant.cohort_baseline_base AS
+SELECT
+    ci.stay_id,
+    ci.subject_id,
+    ci.hadm_id,
+    ci.t0,
+    ci.tL,
+
+    bfs.gender,
+    bfs.age_icu AS age,
+
+    adm.race
+FROM anticoagulant.cohort_index ci
+JOIN anticoagulant.base_first_stay bfs
+  ON bfs.stay_id = ci.stay_id
+JOIN mimiciv_hosp.admissions adm
+  ON adm.subject_id = ci.subject_id
+ AND adm.hadm_id    = ci.hadm_id
+WHERE ci.landmark_eligible_flag = 1;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_cbb_stay_id
+  ON anticoagulant.cohort_baseline_base(stay_id);
+
+CREATE INDEX IF NOT EXISTS idx_cbb_subj_hadm
+  ON anticoagulant.cohort_baseline_base(subject_id, hadm_id);
+
+ANALYZE anticoagulant.cohort_baseline_base;
+
+
+
+
+--1.8B
+DROP TABLE IF EXISTS anticoagulant.baseline_labs_t0;
+
+CREATE TABLE anticoagulant.baseline_labs_t0 AS
+WITH cohort AS (
+  SELECT stay_id, subject_id, hadm_id, t0
+  FROM anticoagulant.cohort_baseline_base
+),
+labs AS (
+  SELECT
+      c.stay_id,
+      le.itemid,
+      le.charttime,
+      le.labevent_id,
+      le.valuenum::numeric AS val_raw,
+      lower(coalesce(le.valueuom,'')) AS uom
+  FROM cohort c
+  JOIN mimiciv_hosp.labevents le
+    ON le.subject_id = c.subject_id
+   AND le.hadm_id    = c.hadm_id
+   AND le.charttime <= c.t0
+  WHERE le.valuenum IS NOT NULL
+    AND le.itemid IN (
+      51237, -- INR
+      51275, -- aPTT / PTT
+      51222, -- Hemoglobin
+      50912, -- Creatinine
+      50813  -- Lactate
+    )
+),
+picked AS (
+  SELECT DISTINCT ON (stay_id, itemid)
+      stay_id, itemid, charttime,
+      CASE
+        WHEN itemid = 50912 AND (uom LIKE '%umol%' OR uom LIKE '%µmol%') THEN val_raw / 88.4
+        ELSE val_raw
+      END AS val_std
+  FROM labs
+  ORDER BY stay_id, itemid, charttime DESC, labevent_id DESC
+)
+SELECT
+    c.stay_id,
+
+    MAX(CASE WHEN p.itemid = 51237 THEN p.val_std END) AS inr,
+    MAX(CASE WHEN p.itemid = 51237 THEN p.charttime END) AS inr_time,
+
+    MAX(CASE WHEN p.itemid = 51275 THEN p.val_std END) AS aptt,
+    MAX(CASE WHEN p.itemid = 51275 THEN p.charttime END) AS aptt_time,
+
+    MAX(CASE WHEN p.itemid = 51222 THEN p.val_std END) AS hb,
+    MAX(CASE WHEN p.itemid = 51222 THEN p.charttime END) AS hb_time,
+
+    MAX(CASE WHEN p.itemid = 50912 THEN p.val_std END) AS creat_mgdl,
+    MAX(CASE WHEN p.itemid = 50912 THEN p.charttime END) AS creat_time,
+
+    MAX(CASE WHEN p.itemid = 50813 THEN p.val_std END) AS lactate,
+    MAX(CASE WHEN p.itemid = 50813 THEN p.charttime END) AS lactate_time
+FROM cohort c
+LEFT JOIN picked p
+  ON p.stay_id = c.stay_id
+GROUP BY c.stay_id;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_baseline_labs_t0_stay
+  ON anticoagulant.baseline_labs_t0(stay_id);
+
+ANALYZE anticoagulant.baseline_labs_t0;
+
+
+
+
+---1.8C
+DROP TABLE IF EXISTS anticoagulant.baseline_plt_t0;
+
+CREATE TABLE anticoagulant.baseline_plt_t0 AS
+SELECT
+  c.stay_id,
+  p.plt_k_t0::numeric AS plt_k_t0,
+  p.t0::timestamp     AS plt_t0_time
+FROM anticoagulant.cohort_baseline_base c
+LEFT JOIN anticoagulant.plt_t0 p
+  ON p.stay_id = c.stay_id;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_baseline_plt_t0_stay
+  ON anticoagulant.baseline_plt_t0(stay_id);
+
+
+
+
+
+----1.8D
+CREATE INDEX IF NOT EXISTS idx_sofa_stay_endtime_notnull
+ON mimiciv_derived.sofa (stay_id, endtime DESC)
+WHERE sofa_24hours IS NOT NULL AND endtime IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_sofa_stay_start_end_notnull
+ON mimiciv_derived.sofa (stay_id, starttime, endtime)
+WHERE sofa_24hours IS NOT NULL AND starttime IS NOT NULL AND endtime IS NOT NULL;
+
+ANALYZE mimiciv_derived.sofa;
+
+DROP TABLE IF EXISTS anticoagulant.baseline_sofa_t0;
+
+CREATE TABLE anticoagulant.baseline_sofa_t0 AS
+SELECT
+    c.stay_id,
+    s_pick.sofa_24hours::numeric      AS sofa_24h_t0,
+    s_pick.starttime::timestamp       AS sofa_time_start,
+    s_pick.endtime::timestamp         AS sofa_time_end,
+    CASE
+      WHEN s_pick.pick_rule = 1 THEN 'window_contains_t0'
+      WHEN s_pick.pick_rule = 2 THEN 'latest_endtime_le_t0'
+      ELSE 'missing'
+    END AS sofa_pick_rule
+FROM anticoagulant.cohort_baseline_base c
+LEFT JOIN LATERAL (
+    SELECT
+        s.sofa_24hours,
+        s.starttime,
+        s.endtime,
+        CASE
+          -- 关键改动：endtime >= t0（以前是 > t0）
+          WHEN s.starttime IS NOT NULL
+           AND s.endtime   IS NOT NULL
+           AND s.starttime <= c.t0
+           AND s.endtime   >= c.t0
+          THEN 1
+          WHEN s.endtime IS NOT NULL
+           AND s.endtime <= c.t0
+          THEN 2
+          ELSE 9
+        END AS pick_rule
+    FROM mimiciv_derived.sofa s
+    WHERE s.stay_id = c.stay_id
+      AND s.sofa_24hours IS NOT NULL
+      AND (
+           -- 关键改动：endtime >= t0（以前是 > t0）
+           (s.starttime IS NOT NULL AND s.endtime IS NOT NULL AND s.starttime <= c.t0 AND s.endtime >= c.t0)
+        OR (s.endtime IS NOT NULL AND s.endtime <= c.t0)
+      )
+    ORDER BY
+      pick_rule ASC,
+      -- 对规则 1：覆盖 t0 的窗口，取 starttime 最近的那条
+      CASE WHEN (s.starttime IS NOT NULL AND s.endtime IS NOT NULL AND s.starttime <= c.t0 AND s.endtime >= c.t0)
+           THEN s.starttime END DESC NULLS LAST,
+      -- 对规则 2：回退 endtime<=t0 的最近一条
+      s.endtime DESC
+    LIMIT 1
+) s_pick ON TRUE;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_baseline_sofa_t0_stay
+  ON anticoagulant.baseline_sofa_t0(stay_id);
+
+ANALYZE anticoagulant.baseline_sofa_t0;
+
+
+
+---1.8E
+CREATE INDEX IF NOT EXISTS idx_weight_dur_stay_time
+ON mimiciv_derived.weight_durations (stay_id, starttime, endtime)
+WHERE weight IS NOT NULL AND starttime IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_weight_dur_stay_start
+ON mimiciv_derived.weight_durations (stay_id, starttime DESC)
+WHERE weight IS NOT NULL AND starttime IS NOT NULL;
+
+ANALYZE mimiciv_derived.weight_durations;
+
+
+DROP TABLE IF EXISTS anticoagulant.baseline_weight_t0;
+
+CREATE TABLE anticoagulant.baseline_weight_t0 AS
+SELECT
+    c.stay_id,
+    w_pick.weight_kg::numeric     AS weight_kg,
+    w_pick.starttime::timestamp   AS weight_time_start,
+    w_pick.endtime::timestamp     AS weight_time_end,
+    CASE
+      WHEN w_pick.pick_rule = 1 THEN 'window_contains_t0'
+      WHEN w_pick.pick_rule = 2 THEN 'latest_starttime_le_t0'
+      ELSE 'missing'
+    END AS weight_pick_rule
+FROM anticoagulant.cohort_baseline_base c
+LEFT JOIN LATERAL (
+    SELECT
+        s.weight::numeric AS weight_kg,
+        s.starttime,
+        s.endtime,
+        CASE
+          -- 规则1：覆盖 t0 的持续区间（闭区间到右端）
+          WHEN s.starttime IS NOT NULL
+           AND s.starttime <= c.t0
+           AND (s.endtime IS NULL OR s.endtime >= c.t0)
+          THEN 1
+          -- 规则2：回退到 t0 前最近一次记录
+          WHEN s.starttime IS NOT NULL
+           AND s.starttime <= c.t0
+          THEN 2
+          ELSE 9
+        END AS pick_rule
+    FROM mimiciv_derived.weight_durations s
+    WHERE s.stay_id = c.stay_id
+      AND s.weight IS NOT NULL
+      AND s.starttime IS NOT NULL
+      AND s.starttime <= c.t0
+    ORDER BY
+      pick_rule ASC,
+      -- 覆盖 t0 时，取 starttime 最近的那段
+      s.starttime DESC,
+      -- 回退时也按 starttime 最近
+      s.endtime DESC NULLS LAST
+    LIMIT 1
+) w_pick ON TRUE;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_baseline_weight_t0_stay
+  ON anticoagulant.baseline_weight_t0(stay_id);
+
+ANALYZE anticoagulant.baseline_weight_t0;
+
+
+
+---1.8F
+-- CCI：优先使用 mimiciv_derived.charlson（若你 derived 已含）
+DROP TABLE IF EXISTS anticoagulant.baseline_cci;
+
+CREATE TABLE anticoagulant.baseline_cci AS
+WITH cand AS (
+  SELECT t.table_name AS tbl
+  FROM information_schema.tables t
+  WHERE t.table_schema='mimiciv_derived' AND t.table_name='charlson'
+)
+SELECT
+  c.stay_id,
+  ch.hadm_id,
+  ch.charlson_comorbidity_index::numeric AS cci
+FROM anticoagulant.cohort_baseline_base c
+LEFT JOIN mimiciv_derived.charlson ch
+  ON ch.hadm_id = c.hadm_id;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_baseline_cci_stay
+  ON anticoagulant.baseline_cci(stay_id);
+
+ANALYZE anticoagulant.baseline_cci;
+
+-- 恶性肿瘤：本次住院 ICD（广覆盖：ICD10 C* + D0*；ICD9 140-208 + 2386）
+DROP TABLE IF EXISTS anticoagulant.baseline_cancer_flag;
+
+CREATE TABLE anticoagulant.baseline_cancer_flag AS
+WITH dx AS (
+  SELECT
+    c.stay_id,
+    d.icd_version,
+    upper(replace(d.icd_code, '.', '')) AS icd_code
+  FROM anticoagulant.cohort_baseline_base c
+  JOIN mimiciv_hosp.diagnoses_icd d
+    ON d.subject_id = c.subject_id
+   AND d.hadm_id    = c.hadm_id
+)
+SELECT
+  stay_id,
+  MAX(
+    CASE
+      WHEN icd_version = 10 AND (icd_code LIKE 'C%' OR icd_code LIKE 'D0%') THEN 1
+      WHEN icd_version = 9  AND (
+           (icd_code ~ '^[0-9]{3,5}$' AND substring(icd_code,1,3)::int BETWEEN 140 AND 208)
+           OR icd_code = '2386'
+      ) THEN 1
+      ELSE 0
+    END
+  ) AS cancer_flag
+FROM dx
+GROUP BY stay_id;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_baseline_cancer_stay
+  ON anticoagulant.baseline_cancer_flag(stay_id);
+
+ANALYZE anticoagulant.baseline_cancer_flag;
+
+
+
+---1.8G
+DO $$
+DECLARE
+  v_exists int;
+  v_status_col text;
+BEGIN
+  SELECT COUNT(*) INTO v_exists
+  FROM information_schema.tables
+  WHERE table_schema='mimiciv_derived' AND table_name='ventilation';
+
+  EXECUTE 'DROP TABLE IF EXISTS anticoagulant.baseline_vent_flag';
+
+  IF v_exists = 0 THEN
+    -- 若无 derived ventilation 表，则输出全 NULL（不中断流程）
+    EXECUTE
+      'CREATE TABLE anticoagulant.baseline_vent_flag AS
+       SELECT stay_id, NULL::int AS vent_on_t0_flag
+       FROM anticoagulant.cohort_baseline_base';
+  ELSE
+    SELECT c.column_name INTO v_status_col
+    FROM information_schema.columns c
+    WHERE c.table_schema='mimiciv_derived' AND c.table_name='ventilation'
+      AND c.column_name IN ('ventilation_status','ventilation','status')
+    ORDER BY CASE c.column_name WHEN 'ventilation_status' THEN 1 ELSE 2 END
+    LIMIT 1;
+
+    IF v_status_col IS NULL THEN
+      EXECUTE
+        'CREATE TABLE anticoagulant.baseline_vent_flag AS
+         SELECT
+           c.stay_id,
+           CASE WHEN EXISTS (
+             SELECT 1 FROM mimiciv_derived.ventilation v
+             WHERE v.stay_id = c.stay_id
+               AND v.starttime <= c.t0
+               AND (v.endtime IS NULL OR v.endtime > c.t0)
+           ) THEN 1 ELSE 0 END AS vent_on_t0_flag
+         FROM anticoagulant.cohort_baseline_base c';
+    ELSE
+      EXECUTE format(
+        'CREATE TABLE anticoagulant.baseline_vent_flag AS
+         SELECT
+           c.stay_id,
+           CASE WHEN EXISTS (
+             SELECT 1 FROM mimiciv_derived.ventilation v
+             WHERE v.stay_id = c.stay_id
+               AND v.starttime <= c.t0
+               AND (v.endtime IS NULL OR v.endtime > c.t0)
+               AND lower(v.%I) LIKE ''%%invasive%%''
+           ) THEN 1 ELSE 0 END AS vent_on_t0_flag
+         FROM anticoagulant.cohort_baseline_base c',
+        v_status_col
+      );
+    END IF;
+  END IF;
+
+  EXECUTE 'CREATE UNIQUE INDEX IF NOT EXISTS idx_baseline_vent_stay ON anticoagulant.baseline_vent_flag(stay_id)';
+  EXECUTE 'ANALYZE anticoagulant.baseline_vent_flag';
+END $$;
+
+CREATE INDEX IF NOT EXISTS idx_rrt_stay_charttime
+ON mimiciv_derived.rrt (stay_id, charttime);
+
+ANALYZE mimiciv_derived.rrt;
+
+DROP TABLE IF EXISTS anticoagulant.baseline_rrt_flag;
+
+CREATE TABLE anticoagulant.baseline_rrt_flag AS
+SELECT
+  c.stay_id,
+  CASE
+    WHEN EXISTS (
+      SELECT 1
+      FROM mimiciv_derived.rrt r
+      WHERE r.stay_id = c.stay_id
+        AND r.charttime <= c.t0
+        AND r.charttime >= (c.t0 - INTERVAL '6 hours')
+    )
+    THEN 1 ELSE 0
+  END AS rrt_on_t0_flag,
+
+  -- 便于审计：t0 前最近一次 rrt 记录时间
+  (
+    SELECT MAX(r2.charttime)
+    FROM mimiciv_derived.rrt r2
+    WHERE r2.stay_id = c.stay_id
+      AND r2.charttime <= c.t0
+  ) AS last_rrt_time_le_t0
+
+FROM anticoagulant.cohort_baseline_base c;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_baseline_rrt_stay
+  ON anticoagulant.baseline_rrt_flag(stay_id);
+
+ANALYZE anticoagulant.baseline_rrt_flag;
+
+
+--1.8H
+DROP TABLE IF EXISTS anticoagulant.baseline_covariates;
+
+CREATE TABLE anticoagulant.baseline_covariates AS
+WITH base AS (
+  SELECT
+    c.stay_id,
+    c.subject_id,
+    c.hadm_id,
+    c.t0,
+    c.gender,
+    c.age,
+    c.race
+  FROM anticoagulant.cohort_baseline_base c
+),
+egfr AS (
+  SELECT
+    b.stay_id,
+    labs.creat_mgdl,
+    b.age,
+    b.gender,
+    CASE
+      WHEN labs.creat_mgdl IS NULL OR b.age IS NULL OR b.gender IS NULL THEN NULL
+      ELSE
+        (
+          142
+          * power(
+              LEAST(
+                labs.creat_mgdl / CASE WHEN lower(b.gender) IN ('f','female') THEN 0.7 ELSE 0.9 END,
+                1
+              ),
+              CASE WHEN lower(b.gender) IN ('f','female') THEN -0.241 ELSE -0.302 END
+            )
+          * power(
+              GREATEST(
+                labs.creat_mgdl / CASE WHEN lower(b.gender) IN ('f','female') THEN 0.7 ELSE 0.9 END,
+                1
+              ),
+              -1.200
+            )
+          * power(0.9938, b.age)
+          * CASE WHEN lower(b.gender) IN ('f','female') THEN 1.012 ELSE 1.000 END
+        )
+    END AS egfr_ckdepi2021
+  FROM base b
+  LEFT JOIN anticoagulant.baseline_labs_t0 labs
+    ON labs.stay_id = b.stay_id
+)
+SELECT
+  b.stay_id,
+  b.subject_id,
+  b.hadm_id,
+  b.t0,
+
+  b.age,
+  b.gender,
+  b.race,
+
+  -- 体重（对齐 1.8E 新字段）
+  w.weight_kg,
+  w.weight_time_start,
+  w.weight_time_end,
+  w.weight_pick_rule,
+
+  -- SOFA（对齐你使用 sofa_24hours at t0 的字段）
+  s.sofa_24h_t0,
+  s.sofa_time_start AS sofa_time_start,
+  s.sofa_time_end   AS sofa_time_end,
+  s.sofa_pick_rule  AS sofa_pick_rule,
+
+  -- CCI
+  cci.cci,
+
+  -- PLT
+  p.plt_k_t0,
+
+  -- labs
+  labs.inr,
+  labs.aptt,
+  labs.hb,
+  labs.creat_mgdl,
+  labs.lactate,
+  labs.inr_time,
+  labs.aptt_time,
+  labs.hb_time,
+  labs.creat_time,
+  labs.lactate_time,
+
+  -- 肿瘤
+  can.cancer_flag,
+
+  -- eGFR
+  e.egfr_ckdepi2021,
+
+  -- 机械通气 / RRT
+  v.vent_on_t0_flag,
+  r.rrt_on_t0_flag,
+  r.last_rrt_time_le_t0
+
+FROM base b
+LEFT JOIN anticoagulant.baseline_weight_t0 w
+  ON w.stay_id = b.stay_id
+LEFT JOIN anticoagulant.baseline_sofa_t0 s
+  ON s.stay_id = b.stay_id
+LEFT JOIN anticoagulant.baseline_cci cci
+  ON cci.stay_id = b.stay_id
+LEFT JOIN anticoagulant.baseline_plt_t0 p
+  ON p.stay_id = b.stay_id
+LEFT JOIN anticoagulant.baseline_labs_t0 labs
+  ON labs.stay_id = b.stay_id
+LEFT JOIN anticoagulant.baseline_cancer_flag can
+  ON can.stay_id = b.stay_id
+LEFT JOIN egfr e
+  ON e.stay_id = b.stay_id
+LEFT JOIN anticoagulant.baseline_vent_flag v
+  ON v.stay_id = b.stay_id
+LEFT JOIN anticoagulant.baseline_rrt_flag r
+  ON r.stay_id = b.stay_id;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_baseline_covariates_stay
+  ON anticoagulant.baseline_covariates(stay_id);
+
+ANALYZE anticoagulant.baseline_covariates;
+
+
+
+
+-----1.9A｜随访基表
+DROP TABLE IF EXISTS anticoagulant.followup_base_28d;
+
+CREATE TABLE anticoagulant.followup_base_28d AS
+SELECT
+    ci.subject_id,
+    ci.hadm_id,
+    ci.stay_id,
+
+    ci.tL::timestamp AS time0,
+    (ci.tL + INTERVAL '28 days')::timestamp AS admin_end_28d,
+
+    bfs.dischtime::timestamp AS dischtime,
+    bfs.deathtime::timestamp AS deathtime,
+
+    LEAST(
+      COALESCE(bfs.dischtime::timestamp, (ci.tL + INTERVAL '28 days')::timestamp),
+      (ci.tL + INTERVAL '28 days')::timestamp
+    ) AS obs_end_28d
+FROM anticoagulant.cohort_index ci
+JOIN anticoagulant.base_first_stay bfs
+  ON bfs.stay_id = ci.stay_id
+WHERE ci.landmark_eligible_flag = 1;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_followup_base_28d_stay
+  ON anticoagulant.followup_base_28d(stay_id);
+
+ANALYZE anticoagulant.followup_base_28d;
+
+
+--1.9B
+DROP TABLE IF EXISTS anticoagulant.vte_events_radiology_timefix;
+
+CREATE TABLE anticoagulant.vte_events_radiology_timefix AS
+SELECT
+    e.stay_id,
+    e.subject_id,
+    e.hadm_id,
+    e.note_id,
+    COALESCE(e.event_time, r.note_time, r.storetime)::timestamp AS event_time_fix,
+    e.event_type,
+    e.section_used
+FROM anticoagulant.vte_events_radiology e
+LEFT JOIN anticoagulant.radiology_notes_cohort r
+  ON r.stay_id = e.stay_id
+ AND r.note_id = e.note_id
+WHERE COALESCE(e.event_time, r.note_time, r.storetime) IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_vte_timefix_stay_time
+  ON anticoagulant.vte_events_radiology_timefix(stay_id, event_time_fix);
+
+ANALYZE anticoagulant.vte_events_radiology_timefix;
+
+
+
+DROP TABLE IF EXISTS anticoagulant.outcome_vte_28d;
+
+CREATE TABLE anticoagulant.outcome_vte_28d AS
+WITH hits AS (
+  SELECT
+    f.stay_id,
+    MIN(v.event_time_fix) AS first_vte_time,
+    MIN(CASE WHEN v.event_type='PE'  THEN v.event_time_fix END) AS first_pe_time,
+    MIN(CASE WHEN v.event_type='DVT' THEN v.event_time_fix END) AS first_dvt_time
+  FROM anticoagulant.followup_base_28d f
+  JOIN anticoagulant.vte_events_radiology_timefix v
+    ON v.stay_id = f.stay_id
+   AND v.event_time_fix > f.time0
+   AND v.event_time_fix <= f.obs_end_28d
+  GROUP BY f.stay_id
+)
+SELECT
+  f.stay_id,
+  CASE WHEN h.first_vte_time IS NULL THEN 0 ELSE 1 END AS vte_flag_28d,
+  h.first_vte_time,
+  h.first_pe_time,
+  h.first_dvt_time
+FROM anticoagulant.followup_base_28d f
+LEFT JOIN hits h
+  ON h.stay_id = f.stay_id;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_outcome_vte_28d_stay
+  ON anticoagulant.outcome_vte_28d(stay_id);
+
+ANALYZE anticoagulant.outcome_vte_28d;
+
+
+
+----1.9C｜大出血结局
+DROP TABLE IF EXISTS anticoagulant.rbc_itemids;
+
+CREATE TABLE anticoagulant.rbc_itemids AS
+SELECT DISTINCT di.itemid
+FROM mimiciv_icu.d_items di
+WHERE lower(di.label) LIKE '%packed red%'
+   OR lower(di.label) LIKE '%prbc%'
+   OR lower(di.label) LIKE '%red blood cell%'
+   OR lower(di.label) = 'rbc';
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_rbc_itemids_itemid
+  ON anticoagulant.rbc_itemids(itemid);
+
+ANALYZE anticoagulant.rbc_itemids;
+
+
+DROP TABLE IF EXISTS anticoagulant.rbc_events_fu_28d;
+
+CREATE UNLOGGED TABLE anticoagulant.rbc_events_fu_28d AS
+SELECT
+  f.stay_id,
+  ie.starttime::timestamp AS event_time,
+  ie.itemid,
+  di.label,
+  ie.amount,
+  ie.amountuom
+FROM anticoagulant.followup_base_28d f
+JOIN mimiciv_icu.inputevents ie
+  ON ie.stay_id = f.stay_id
+ AND ie.starttime >  f.time0
+ AND ie.starttime <= f.obs_end_28d
+JOIN anticoagulant.rbc_itemids x
+  ON x.itemid = ie.itemid
+JOIN mimiciv_icu.d_items di
+  ON di.itemid = ie.itemid;
+
+CREATE INDEX IF NOT EXISTS idx_rbc_events_fu_28d_stay_time
+  ON anticoagulant.rbc_events_fu_28d(stay_id, event_time);
+
+ANALYZE anticoagulant.rbc_events_fu_28d;
+
+
+
+DROP TABLE IF EXISTS anticoagulant.bleed_rbc2_24h_28d;
+
+CREATE TABLE anticoagulant.bleed_rbc2_24h_28d AS
+WITH ord AS (
+  SELECT
+    stay_id,
+    event_time,
+    LAG(event_time) OVER (PARTITION BY stay_id ORDER BY event_time) AS prev_time
+  FROM anticoagulant.rbc_events_fu_28d
+),
+hit AS (
+  SELECT
+    stay_id,
+    MIN(event_time) AS bleed_time_rbc2
+  FROM ord
+  WHERE prev_time IS NOT NULL
+    AND (event_time - prev_time) <= INTERVAL '24 hours'
+  GROUP BY stay_id
+)
+SELECT
+  f.stay_id,
+  CASE WHEN h.bleed_time_rbc2 IS NULL THEN 0 ELSE 1 END AS bleed_rbc2_flag,
+  h.bleed_time_rbc2
+FROM anticoagulant.followup_base_28d f
+LEFT JOIN hit h
+  ON h.stay_id = f.stay_id;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_bleed_rbc2_28d_stay
+  ON anticoagulant.bleed_rbc2_24h_28d(stay_id);
+
+ANALYZE anticoagulant.bleed_rbc2_24h_28d;
+
+
+
+DROP TABLE IF EXISTS anticoagulant.bleed_hbdrop_28d;
+
+CREATE TABLE anticoagulant.bleed_hbdrop_28d AS
+WITH cohort AS (
+  SELECT stay_id, subject_id, hadm_id, time0, obs_end_28d
+  FROM anticoagulant.followup_base_28d
+),
+hb AS (
+  SELECT
+    c.stay_id,
+    c.time0,
+    c.obs_end_28d,
+    le.charttime::timestamp AS charttime,
+    le.labevent_id,
+    le.valuenum::numeric AS hb_g_dl
+  FROM cohort c
+  JOIN mimiciv_hosp.labevents le
+    ON le.subject_id = c.subject_id
+   AND le.hadm_id    = c.hadm_id
+  WHERE le.itemid = 51222
+    AND le.valuenum IS NOT NULL
+    AND le.charttime >= (c.time0 - INTERVAL '24 hours')
+    AND le.charttime <= c.obs_end_28d
+),
+baseline AS (
+  -- baseline = 最后一条 Hb <= time0（限定在 time0 前 24h 内，避免过旧）
+  SELECT DISTINCT ON (stay_id)
+    stay_id,
+    hb_g_dl AS hb_baseline,
+    charttime AS hb_baseline_time
+  FROM hb
+  WHERE charttime <= time0
+  ORDER BY stay_id, charttime DESC, labevent_id DESC
+),
+drop_candidates AS (
+  SELECT
+    h.stay_id,
+    h.charttime AS low_hb_time,
+    b.hb_baseline,
+    (b.hb_baseline - h.hb_g_dl) AS hb_drop
+  FROM hb h
+  JOIN baseline b
+    ON b.stay_id = h.stay_id
+  WHERE h.charttime > h.time0
+    AND h.charttime <= h.obs_end_28d
+    AND (b.hb_baseline - h.hb_g_dl) >= 2
+),
+first_drop AS (
+  SELECT DISTINCT ON (stay_id)
+    stay_id,
+    low_hb_time,
+    hb_baseline,
+    hb_drop
+  FROM drop_candidates
+  ORDER BY stay_id, low_hb_time ASC
+),
+with_rbc AS (
+  SELECT
+    d.stay_id,
+    d.low_hb_time AS bleed_time_hbdrop,
+    d.hb_baseline,
+    d.hb_drop
+  FROM first_drop d
+  WHERE EXISTS (
+    SELECT 1
+    FROM anticoagulant.rbc_events_fu_28d r
+    WHERE r.stay_id = d.stay_id
+      AND r.event_time >  (d.low_hb_time - INTERVAL '24 hours')
+      AND r.event_time <= d.low_hb_time
+  )
+)
+SELECT
+  f.stay_id,
+  CASE WHEN w.bleed_time_hbdrop IS NULL THEN 0 ELSE 1 END AS bleed_hbdrop_flag,
+  w.bleed_time_hbdrop,
+  w.hb_baseline,
+  w.hb_drop
+FROM anticoagulant.followup_base_28d f
+LEFT JOIN with_rbc w
+  ON w.stay_id = f.stay_id;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_bleed_hbdrop_28d_stay
+  ON anticoagulant.bleed_hbdrop_28d(stay_id);
+
+ANALYZE anticoagulant.bleed_hbdrop_28d;
+
+
+
+
+DROP TABLE IF EXISTS anticoagulant.outcome_major_bleed_28d;
+
+CREATE TABLE anticoagulant.outcome_major_bleed_28d AS
+SELECT
+  f.stay_id,
+
+  CASE
+    WHEN r.bleed_time_rbc2 IS NULL AND h.bleed_time_hbdrop IS NULL THEN 0
+    ELSE 1
+  END AS major_bleed_flag_28d,
+
+  CASE
+    WHEN r.bleed_time_rbc2 IS NOT NULL AND h.bleed_time_hbdrop IS NOT NULL
+      THEN LEAST(r.bleed_time_rbc2, h.bleed_time_hbdrop)
+    WHEN r.bleed_time_rbc2 IS NOT NULL THEN r.bleed_time_rbc2
+    WHEN h.bleed_time_hbdrop IS NOT NULL THEN h.bleed_time_hbdrop
+    ELSE NULL
+  END AS major_bleed_time,
+
+  r.bleed_time_rbc2,
+  h.bleed_time_hbdrop,
+  h.hb_baseline,
+  h.hb_drop
+FROM anticoagulant.followup_base_28d f
+LEFT JOIN anticoagulant.bleed_rbc2_24h_28d r
+  ON r.stay_id = f.stay_id
+LEFT JOIN anticoagulant.bleed_hbdrop_28d h
+  ON h.stay_id = f.stay_id;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_outcome_major_bleed_28d_stay
+  ON anticoagulant.outcome_major_bleed_28d(stay_id);
+
+ANALYZE anticoagulant.outcome_major_bleed_28d;
+
+
+
+
+---1.9D
+DROP TABLE IF EXISTS anticoagulant.outcome_death_28d;
+
+CREATE TABLE anticoagulant.outcome_death_28d AS
+SELECT
+  f.stay_id,
+  CASE
+    WHEN f.deathtime IS NOT NULL
+     AND f.deathtime > f.time0
+     AND f.deathtime <= f.obs_end_28d
+    THEN 1 ELSE 0
+  END AS death_flag_28d,
+  CASE
+    WHEN f.deathtime IS NOT NULL
+     AND f.deathtime > f.time0
+     AND f.deathtime <= f.obs_end_28d
+    THEN f.deathtime
+    ELSE NULL
+  END AS death_time
+FROM anticoagulant.followup_base_28d f;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_outcome_death_28d_stay
+  ON anticoagulant.outcome_death_28d(stay_id);
+
+ANALYZE anticoagulant.outcome_death_28d;
+
+
+
+---1.9E
+DROP TABLE IF EXISTS anticoagulant.outcome_events;
+
+CREATE TABLE anticoagulant.outcome_events AS
+SELECT
+  f.subject_id,
+  f.hadm_id,
+  f.stay_id,
+
+  f.time0,
+  f.obs_end_28d,
+
+  -- 观测删失：出院或 28d；死亡则观测终止于死亡
+  LEAST(
+    f.obs_end_28d,
+    COALESCE(f.deathtime, f.obs_end_28d)
+  ) AS censor_time,
+
+  EXTRACT(EPOCH FROM (LEAST(f.obs_end_28d, COALESCE(f.deathtime, f.obs_end_28d)) - f.time0)) / 86400.0 AS fup_days,
+
+  v.vte_flag_28d,
+  v.first_vte_time,
+  v.first_pe_time,
+  v.first_dvt_time,
+
+  b.major_bleed_flag_28d,
+  b.major_bleed_time,
+  b.bleed_time_rbc2,
+  b.bleed_time_hbdrop,
+
+  d.death_flag_28d,
+  d.death_time,
+
+  -- 最早事件（便于快速 QC / 生存分析初筛；不替代你后续正式建模）
+  CASE
+    WHEN LEAST(
+      COALESCE(v.first_vte_time,    TIMESTAMP '9999-12-31'),
+      COALESCE(b.major_bleed_time,  TIMESTAMP '9999-12-31'),
+      COALESCE(d.death_time,        TIMESTAMP '9999-12-31')
+    ) = TIMESTAMP '9999-12-31'
+    THEN NULL
+    WHEN COALESCE(v.first_vte_time,   TIMESTAMP '9999-12-31')
+       <= COALESCE(b.major_bleed_time,TIMESTAMP '9999-12-31')
+     AND COALESCE(v.first_vte_time,   TIMESTAMP '9999-12-31')
+       <= COALESCE(d.death_time,      TIMESTAMP '9999-12-31')
+    THEN 'VTE'
+    WHEN COALESCE(b.major_bleed_time, TIMESTAMP '9999-12-31')
+       <= COALESCE(d.death_time,      TIMESTAMP '9999-12-31')
+    THEN 'MAJOR_BLEED'
+    ELSE 'DEATH'
+  END AS first_event_type,
+
+  LEAST(
+    COALESCE(v.first_vte_time,    TIMESTAMP '9999-12-31'),
+    COALESCE(b.major_bleed_time,  TIMESTAMP '9999-12-31'),
+    COALESCE(d.death_time,        TIMESTAMP '9999-12-31')
+  ) AS first_event_time
+
+FROM anticoagulant.followup_base_28d f
+LEFT JOIN anticoagulant.outcome_vte_28d v
+  ON v.stay_id = f.stay_id
+LEFT JOIN anticoagulant.outcome_major_bleed_28d b
+  ON b.stay_id = f.stay_id
+LEFT JOIN anticoagulant.outcome_death_28d d
+  ON d.stay_id = f.stay_id;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_outcome_events_stay
+  ON anticoagulant.outcome_events(stay_id);
+
+CREATE INDEX IF NOT EXISTS idx_outcome_events_vte
+  ON anticoagulant.outcome_events(vte_flag_28d);
+
+CREATE INDEX IF NOT EXISTS idx_outcome_events_bleed
+  ON anticoagulant.outcome_events(major_bleed_flag_28d);
+
+CREATE INDEX IF NOT EXISTS idx_outcome_events_death
+  ON anticoagulant.outcome_events(death_flag_28d);
+
+ANALYZE anticoagulant.outcome_events;
+
+
+
+-----step1.10
+/*============================================================
+ Step 1.10  Final analysis wide table (aligned to your columns)
+ Inputs:
+   - anticoagulant.cohort_index (landmark_eligible_flag=1)
+   - anticoagulant.exposure_24h
+   - anticoagulant.baseline_covariates  (your actual column set)
+   - anticoagulant.outcome_events
+ Output:
+   - anticoagulant.analysis_wide
+============================================================*/
+
+DROP TABLE IF EXISTS anticoagulant.analysis_wide;
+
+CREATE TABLE anticoagulant.analysis_wide AS
+WITH ci AS (
+  SELECT *
+  FROM anticoagulant.cohort_index
+  WHERE landmark_eligible_flag = 1
+),
+j AS (
+  SELECT
+    ci.subject_id,
+    ci.hadm_id,
+    ci.stay_id,
+
+    /* design times */
+    ci.t0::timestamp,
+    ci.tL::timestamp,
+
+    /* cohort_index audit flags (keep) */
+    ci.exclude_therapeutic_anticoag_flag,
+    ci.exclude_vte_pre_t0_flag,
+    ci.exclude_active_bleed_t0_flag,
+    ci.in_hosp_at_tL_flag,
+    ci.alive_at_tL_flag,
+    ci.alive_in_hosp_at_tL_flag,
+    ci.death_in_grace_flag,
+    ci.vte_in_grace_flag,
+    ci.major_bleed_in_grace_flag,
+
+    /* exposure */
+    e.source_used,
+    e.treat,
+    e.exposure_group,
+    e.prophy_type,
+    e.first_prophy_time,
+    e.lmwh_n,
+    e.lmwh_max_single_mg,
+    e.lmwh_total_mg,
+    e.ufh_n,
+    e.ufh_max_single_u,
+    e.ufh_total_u,
+    e.any_other_anticoag_flag,
+    e.any_iv_or_infusion_flag,
+    e.any_anticoag_window_flag,
+
+    /* baseline covariates (ALIGNED to your column names) */
+    b.age,
+    b.gender,
+    b.race,
+
+    b.weight_kg,
+    b.weight_time_start,
+    b.weight_time_end,
+    b.weight_pick_rule,
+
+    b.sofa_24h_t0,
+    b.sofa_time_start,
+    b.sofa_time_end,
+    b.sofa_pick_rule,
+
+    b.cci,
+    b.plt_k_t0,
+    b.inr,
+    b.aptt,
+    b.hb,
+    b.creat_mgdl,
+    b.lactate,
+
+    b.inr_time,
+    b.aptt_time,
+    b.hb_time,
+    b.creat_time,
+    b.lactate_time,
+
+    b.cancer_flag,
+    b.egfr_ckdepi2021,
+
+    b.vent_on_t0_flag,
+    b.rrt_on_t0_flag,
+    b.last_rrt_time_le_t0,
+
+    /* outcomes */
+    o.time0,
+    o.obs_end_28d,
+    o.censor_time,
+    o.fup_days,
+
+    o.vte_flag_28d,
+    o.first_vte_time,
+    o.first_pe_time,
+    o.first_dvt_time,
+
+    o.major_bleed_flag_28d,
+    o.major_bleed_time,
+
+    o.death_flag_28d,
+    o.death_time,
+
+    o.first_event_type,
+    o.first_event_time
+
+  FROM ci
+  LEFT JOIN anticoagulant.exposure_24h e
+    ON e.stay_id = ci.stay_id
+  LEFT JOIN anticoagulant.baseline_covariates b
+    ON b.stay_id = ci.stay_id
+  LEFT JOIN anticoagulant.outcome_events o
+    ON o.stay_id = ci.stay_id
+),
+final AS (
+  SELECT
+    j.*,
+
+    /* join integrity flags */
+    CASE WHEN j.source_used IS NULL THEN 1 ELSE 0 END AS missing_exposure_flag,
+    CASE WHEN j.age IS NULL AND j.gender IS NULL THEN 1 ELSE 0 END AS missing_baseline_flag,
+    CASE WHEN j.time0 IS NULL OR j.censor_time IS NULL THEN 1 ELSE 0 END AS missing_outcome_flag,
+
+    /* analysis set flags */
+    CASE WHEN j.exposure_group IN ('A_prophylactic', 'B_none') THEN 1 ELSE 0 END AS primary_analysis_flag,
+
+    CASE
+      WHEN j.exposure_group IN ('A_prophylactic', 'B_none')
+       AND COALESCE(j.any_other_anticoag_flag, 0) = 0
+       AND COALESCE(j.any_iv_or_infusion_flag, 0) = 0
+      THEN 1 ELSE 0
+    END AS pp_analysis_flag,
+
+    /* effective flags (<= censor_time) */
+    CASE
+      WHEN j.first_vte_time IS NOT NULL AND j.censor_time IS NOT NULL AND j.first_vte_time <= j.censor_time
+      THEN 1 ELSE 0
+    END AS vte_flag_eff,
+
+    CASE
+      WHEN j.first_vte_time IS NOT NULL AND j.censor_time IS NOT NULL AND j.first_vte_time <= j.censor_time
+      THEN j.first_vte_time ELSE NULL
+    END AS first_vte_time_eff,
+
+    CASE
+      WHEN j.major_bleed_time IS NOT NULL AND j.censor_time IS NOT NULL AND j.major_bleed_time <= j.censor_time
+      THEN 1 ELSE 0
+    END AS major_bleed_flag_eff,
+
+    CASE
+      WHEN j.major_bleed_time IS NOT NULL AND j.censor_time IS NOT NULL AND j.major_bleed_time <= j.censor_time
+      THEN j.major_bleed_time ELSE NULL
+    END AS major_bleed_time_eff,
+
+    CASE
+      WHEN j.death_time IS NOT NULL AND j.censor_time IS NOT NULL AND j.death_time <= j.censor_time
+      THEN 1 ELSE 0
+    END AS death_flag_eff,
+
+    CASE
+      WHEN j.death_time IS NOT NULL AND j.censor_time IS NOT NULL AND j.death_time <= j.censor_time
+      THEN j.death_time ELSE NULL
+    END AS death_time_eff,
+
+    /* time-to-event (days) */
+    CASE
+      WHEN j.time0 IS NULL OR j.censor_time IS NULL THEN NULL
+      WHEN (j.first_vte_time IS NOT NULL AND j.first_vte_time <= j.censor_time)
+        THEN EXTRACT(EPOCH FROM (j.first_vte_time - j.time0)) / 86400.0
+      ELSE EXTRACT(EPOCH FROM (j.censor_time - j.time0)) / 86400.0
+    END AS anticoagulant_vte_days,
+
+    CASE
+      WHEN j.time0 IS NULL OR j.censor_time IS NULL THEN NULL
+      WHEN (j.major_bleed_time IS NOT NULL AND j.major_bleed_time <= j.censor_time)
+        THEN EXTRACT(EPOCH FROM (j.major_bleed_time - j.time0)) / 86400.0
+      ELSE EXTRACT(EPOCH FROM (j.censor_time - j.time0)) / 86400.0
+    END AS anticoagulant_bleed_days,
+
+    CASE
+      WHEN j.time0 IS NULL OR j.censor_time IS NULL THEN NULL
+      WHEN (j.death_time IS NOT NULL AND j.death_time <= j.censor_time)
+        THEN EXTRACT(EPOCH FROM (j.death_time - j.time0)) / 86400.0
+      ELSE EXTRACT(EPOCH FROM (j.censor_time - j.time0)) / 86400.0
+    END AS anticoagulant_death_days
+
+  FROM j
+)
+SELECT * FROM final;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_analysis_wide_stay
+  ON anticoagulant.analysis_wide(stay_id);
+
+CREATE INDEX IF NOT EXISTS idx_analysis_wide_treat
+  ON anticoagulant.analysis_wide(treat);
+
+CREATE INDEX IF NOT EXISTS idx_analysis_wide_primary
+  ON anticoagulant.analysis_wide(primary_analysis_flag);
+
+CREATE INDEX IF NOT EXISTS idx_analysis_wide_pp
+  ON anticoagulant.analysis_wide(pp_analysis_flag);
+
+ANALYZE anticoagulant.analysis_wide;
+
+
+
+
+/* ============================================================================
+   Step 1.11: Secondary outcomes (28d from tl)
+   - HFD-28 (hospital-free days)
+   - VFD-28 (ventilator-free days; invasive MV)
+   - 28d all-cause mortality
+   - 28d transfusion needs: RBC_any / PLT_any
+   Base table: anticoagulant.analysis_wide_v2
+   Extra joins: anticoagulant.base_first_stay (for dischtime), mimiciv_derived.ventilation, mimiciv_icu.inputevents
+   ============================================================================ */
+
+-- ========== Step 1.11A: Ensure columns exist (idempotent) ==========
+ALTER TABLE anticoagulant.analysis_wide_v2
+  ADD COLUMN IF NOT EXISTS obs_end_28d timestamp,
+  ADD COLUMN IF NOT EXISTS death_28_flag_28d int,
+  ADD COLUMN IF NOT EXISTS death_time_28d timestamp,
+  ADD COLUMN IF NOT EXISTS hosp_days_28d_from_tl numeric,
+  ADD COLUMN IF NOT EXISTS vent_days_28d numeric,
+  ADD COLUMN IF NOT EXISTS vent_n_segments_28d int,
+  ADD COLUMN IF NOT EXISTS hfd_28 numeric,
+  ADD COLUMN IF NOT EXISTS vfd_28 numeric,
+  ADD COLUMN IF NOT EXISTS rbc_any_28d int,
+  ADD COLUMN IF NOT EXISTS rbc_n_events_28d int,
+  ADD COLUMN IF NOT EXISTS rbc_units_28d numeric,
+  ADD COLUMN IF NOT EXISTS rbc_ml_28d numeric,
+  ADD COLUMN IF NOT EXISTS plt_any_28d int,
+  ADD COLUMN IF NOT EXISTS plt_n_events_28d int,
+  ADD COLUMN IF NOT EXISTS plt_units_28d numeric,
+  ADD COLUMN IF NOT EXISTS plt_ml_28d numeric;
+
+-- ========== Step 1.11B: Compute obs_end_28d (28d administrative end, truncated by discharge/death) ==========
+-- Uses: tl from analysis_wide_v2, dischtime from anticoagulant.base_first_stay, death_time_eff (preferred) or death_time
+-- Step 1.11B (recommended): obs_end_28d = min(tl+28d, dischtime)
+WITH base AS (
+  SELECT
+    a.stay_id,
+    a.tl,
+    b.dischtime
+  FROM anticoagulant.analysis_wide_v2 a
+  LEFT JOIN anticoagulant.base_first_stay b
+    ON b.stay_id = a.stay_id
+  WHERE a.tl IS NOT NULL
+),
+calc AS (
+  SELECT
+    stay_id,
+    LEAST(
+      tl + INTERVAL '28 day',
+      COALESCE(dischtime, tl + INTERVAL '28 day')
+    ) AS obs_end_28d_new
+  FROM base
+)
+UPDATE anticoagulant.analysis_wide_v2 a
+SET obs_end_28d = c.obs_end_28d_new
+FROM calc c
+WHERE a.stay_id = c.stay_id;
+
+-- ========== Step 1.11C: 28d death flag/time (from tl) ==========
+-- Step 1.11C (authoritative): align with Step 1.9/1.10 death_flag_28d
+UPDATE anticoagulant.analysis_wide_v2
+SET
+  death_28_flag_28d = COALESCE(death_flag_28d, 0),
+  death_time_28d    = CASE
+                        WHEN COALESCE(death_flag_28d,0) = 1
+                        THEN COALESCE(death_time_eff, death_time)
+                        ELSE NULL
+                      END
+WHERE tl IS NOT NULL;
+
+
+-- ========== Step 1.11D: LOS within 28d window (from tl) ==========
+-- hosp_days_28d_from_tl = min(dischtime, tl+28d) - tl, truncated at [0,28]
+WITH base AS (
+  SELECT
+    a.stay_id,
+    a.tl,
+    a.obs_end_28d,
+    b.dischtime
+  FROM anticoagulant.analysis_wide_v2 a
+  LEFT JOIN anticoagulant.base_first_stay b
+    ON b.stay_id = a.stay_id
+  WHERE a.tl IS NOT NULL AND a.obs_end_28d IS NOT NULL
+),
+calc AS (
+  SELECT
+    stay_id,
+    GREATEST(
+      0,
+      EXTRACT(EPOCH FROM (LEAST(COALESCE(dischtime, obs_end_28d), tl + INTERVAL '28 day') - tl)) / 86400.0
+    ) AS hosp_days_28d
+  FROM base
+)
+UPDATE anticoagulant.analysis_wide_v2 a
+SET hosp_days_28d_from_tl = c.hosp_days_28d
+FROM calc c
+WHERE a.stay_id = c.stay_id;
+
+-- ========== Step 1.11E: Ventilation within 28d window (invasive MV only) ==========
+-- Assumes table: mimiciv_derived.ventilation(stay_id, starttime, endtime, ventilation_status)
+-- You can adjust the status filter if your derived table uses different labels.
+DROP TABLE IF EXISTS anticoagulant.vent_segments_28d;
+
+CREATE TABLE anticoagulant.vent_segments_28d AS
+WITH base AS (
+  SELECT stay_id, tl, obs_end_28d
+  FROM anticoagulant.analysis_wide_v2
+  WHERE tl IS NOT NULL AND obs_end_28d IS NOT NULL
+),
+v AS (
+  SELECT
+    stay_id,
+    starttime,
+    endtime,
+    ventilation_status
+  FROM mimiciv_derived.ventilation
+  WHERE starttime IS NOT NULL
+)
+SELECT
+  b.stay_id,
+  GREATEST(v.starttime, b.tl) AS seg_start,
+  LEAST(COALESCE(v.endtime, b.obs_end_28d), b.obs_end_28d) AS seg_end,
+  v.ventilation_status
+FROM base b
+JOIN v
+  ON v.stay_id = b.stay_id
+WHERE
+  -- invasive MV only (robust to label variance)
+  (v.ventilation_status ~* 'invasive' OR v.ventilation_status ~* 'trach')
+  AND COALESCE(v.endtime, b.obs_end_28d) > b.tl
+  AND v.starttime < b.obs_end_28d;
+
+CREATE INDEX IF NOT EXISTS idx_vent_seg_28d_stay
+  ON anticoagulant.vent_segments_28d(stay_id);
+
+CREATE INDEX IF NOT EXISTS idx_vent_seg_28d_stay_time
+  ON anticoagulant.vent_segments_28d(stay_id, seg_start, seg_end);
+
+ANALYZE anticoagulant.vent_segments_28d;
+
+-- Aggregate vent days + number of segments
+DROP TABLE IF EXISTS anticoagulant.vent_28d_agg;
+
+CREATE TABLE anticoagulant.vent_28d_agg AS
+SELECT
+  stay_id,
+  COUNT(*)::int AS vent_n_segments_28d,
+  COALESCE(SUM(EXTRACT(EPOCH FROM (seg_end - seg_start))) / 86400.0, 0) AS vent_days_28d
+FROM anticoagulant.vent_segments_28d
+WHERE seg_end > seg_start
+GROUP BY stay_id;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_vent_28d_agg_stay
+  ON anticoagulant.vent_28d_agg(stay_id);
+
+ANALYZE anticoagulant.vent_28d_agg;
+
+-- Write back to analysis_wide_v2 (default 0 then update)
+UPDATE anticoagulant.analysis_wide_v2
+SET
+  vent_days_28d = 0,
+  vent_n_segments_28d = 0;
+
+UPDATE anticoagulant.analysis_wide_v2 a
+SET
+  vent_days_28d = v.vent_days_28d,
+  vent_n_segments_28d = v.vent_n_segments_28d
+FROM anticoagulant.vent_28d_agg v
+WHERE a.stay_id = v.stay_id;
+
+-- ========== Step 1.11F: Derive HFD-28 / VFD-28 ==========
+-- Definitions:
+--   if death_28_flag_28d=1 => HFD=0, VFD=0
+--   else HFD = max(0, 28 - hosp_days_28d_from_tl), VFD = max(0, 28 - vent_days_28d)
+WITH base AS (
+  SELECT
+    stay_id,
+    COALESCE(death_28_flag_28d, 0) AS death28,
+    COALESCE(hosp_days_28d_from_tl, 0) AS los28,
+    COALESCE(vent_days_28d, 0) AS vdays28
+  FROM anticoagulant.analysis_wide_v2
+)
+UPDATE anticoagulant.analysis_wide_v2 a
+SET
+  hfd_28 = CASE
+    WHEN b.death28 = 1 THEN 0
+    ELSE GREATEST(0, 28 - LEAST(28, b.los28))
+  END,
+  vfd_28 = CASE
+    WHEN b.death28 = 1 THEN 0
+    ELSE GREATEST(0, 28 - LEAST(28, b.vdays28))
+  END
+FROM base b
+WHERE a.stay_id = b.stay_id;
+
+-- ========== Step 1.11G: Transfusion (RBC/PLT any, within [tl, obs_end_28d)) ==========
+-- (Same logic you已验证成功：stay_id + COALESCE(starttime,endtime))
+DROP TABLE IF EXISTS anticoagulant.transfusion_itemid_map;
+
+CREATE TABLE anticoagulant.transfusion_itemid_map AS
+WITH di AS (
+  SELECT itemid, label, category
+  FROM mimiciv_icu.d_items
+)
+SELECT
+  itemid,
+  label,
+  category,
+  CASE
+    WHEN (category ~* 'blood' OR category ~* 'transfusion' OR category ~* 'blood products')
+     AND (label ~* '(packed\s*red\s*blood\s*cells|p\s*rbc|prbc|red\s*blood\s*cells)')
+      THEN 'RBC'
+    WHEN (category ~* 'blood' OR category ~* 'transfusion' OR category ~* 'blood products')
+     AND (label ~* '(platelet)')
+      THEN 'PLT'
+    ELSE NULL
+  END AS product
+FROM di
+WHERE
+  (category ~* 'blood' OR category ~* 'transfusion' OR category ~* 'blood products')
+  AND (
+       label ~* '(packed\s*red\s*blood\s*cells|p\s*rbc|prbc|red\s*blood\s*cells)'
+    OR label ~* '(platelet)'
+  );
+
+CREATE INDEX IF NOT EXISTS idx_trans_item_map_itemid
+  ON anticoagulant.transfusion_itemid_map(itemid);
+
+ANALYZE anticoagulant.transfusion_itemid_map;
+
+DROP TABLE IF EXISTS anticoagulant.transfusion_events_28d;
+
+CREATE TABLE anticoagulant.transfusion_events_28d AS
+WITH base AS (
+  SELECT stay_id, tl, obs_end_28d
+  FROM anticoagulant.analysis_wide_v2
+  WHERE tl IS NOT NULL AND obs_end_28d IS NOT NULL
+),
+ie AS (
+  SELECT
+    stay_id,
+    itemid,
+    COALESCE(starttime, endtime) AS event_time,
+    amount,
+    amountuom,
+    orderid,
+    linkorderid
+  FROM mimiciv_icu.inputevents
+  WHERE COALESCE(starttime, endtime) IS NOT NULL
+)
+SELECT
+  b.stay_id,
+  m.product,
+  ie.itemid,
+  ie.event_time,
+  ie.amount,
+  ie.amountuom,
+  COALESCE(
+    ie.orderid::text,
+    ie.linkorderid::text,
+    ie.itemid::text || '_' || ie.event_time::text
+  ) AS event_id,
+  CASE WHEN ie.amountuom ~* 'ml' THEN ie.amount ELSE NULL END AS amount_ml,
+  CASE WHEN ie.amountuom ~* 'unit' THEN ie.amount ELSE NULL END AS amount_units
+FROM base b
+JOIN ie
+  ON ie.stay_id = b.stay_id
+JOIN anticoagulant.transfusion_itemid_map m
+  ON m.itemid = ie.itemid
+WHERE ie.event_time >= b.tl
+  AND ie.event_time <  b.obs_end_28d;
+
+CREATE INDEX IF NOT EXISTS idx_trans_ev_28d_stay
+  ON anticoagulant.transfusion_events_28d(stay_id);
+
+CREATE INDEX IF NOT EXISTS idx_trans_ev_28d_stay_time
+  ON anticoagulant.transfusion_events_28d(stay_id, event_time);
+
+ANALYZE anticoagulant.transfusion_events_28d;
+
+DROP TABLE IF EXISTS anticoagulant.transfusion_28d_agg;
+
+CREATE TABLE anticoagulant.transfusion_28d_agg AS
+SELECT
+  stay_id,
+  CASE WHEN COUNT(*) FILTER (WHERE product='RBC') > 0 THEN 1 ELSE 0 END AS rbc_any_28d,
+  COUNT(DISTINCT event_id) FILTER (WHERE product='RBC') AS rbc_n_events_28d,
+  COALESCE(SUM(amount_units) FILTER (WHERE product='RBC'), 0) AS rbc_units_28d,
+  COALESCE(SUM(amount_ml)    FILTER (WHERE product='RBC'), 0) AS rbc_ml_28d,
+  CASE WHEN COUNT(*) FILTER (WHERE product='PLT') > 0 THEN 1 ELSE 0 END AS plt_any_28d,
+  COUNT(DISTINCT event_id) FILTER (WHERE product='PLT') AS plt_n_events_28d,
+  COALESCE(SUM(amount_units) FILTER (WHERE product='PLT'), 0) AS plt_units_28d,
+  COALESCE(SUM(amount_ml)    FILTER (WHERE product='PLT'), 0) AS plt_ml_28d
+FROM anticoagulant.transfusion_events_28d
+GROUP BY stay_id;
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_trans_28d_agg_stay
+  ON anticoagulant.transfusion_28d_agg(stay_id);
+
+ANALYZE anticoagulant.transfusion_28d_agg;
+
+-- Write back (default 0 then update)
+UPDATE anticoagulant.analysis_wide_v2
+SET
+  rbc_any_28d = 0,
+  rbc_n_events_28d = 0,
+  rbc_units_28d = 0,
+  rbc_ml_28d = 0,
+  plt_any_28d = 0,
+  plt_n_events_28d = 0,
+  plt_units_28d = 0,
+  plt_ml_28d = 0;
+
+UPDATE anticoagulant.analysis_wide_v2 a
+SET
+  rbc_any_28d      = t.rbc_any_28d,
+  rbc_n_events_28d = t.rbc_n_events_28d,
+  rbc_units_28d    = t.rbc_units_28d,
+  rbc_ml_28d       = t.rbc_ml_28d,
+  plt_any_28d      = t.plt_any_28d,
+  plt_n_events_28d = t.plt_n_events_28d,
+  plt_units_28d    = t.plt_units_28d,
+  plt_ml_28d       = t.plt_ml_28d
+FROM anticoagulant.transfusion_28d_agg t
+WHERE a.stay_id = t.stay_id;
+
+ANALYZE anticoagulant.analysis_wide_v2;
